@@ -168,9 +168,12 @@ def pwm_from_velocity(v, omega):
     """Convert linear/angular velocity to wheel PWM using current robot params."""
     R = robot_params['R']
     baseline = robot_params['baseline']
-    v_left = (v - omega * baseline / 2.0) / R
-    v_right = (v + omega * baseline / 2.0) / R
-    return float(np.clip(v_left, -1.0, 1.0)), float(np.clip(v_right, -1.0, 1.0))
+    # Wheel linear velocities (m/s)
+    v_left = v - omega * baseline / 2.0
+    v_right = v + omega * baseline / 2.0
+    # Normalize by Godot's max wheel speed (1.0 m/s) to get PWM in [-1, 1]
+    v_max = 1.0
+    return float(np.clip(v_left / v_max, -1.0, 1.0)), float(np.clip(v_right / v_max, -1.0, 1.0))
 
 
 def update_odometry_and_path():
