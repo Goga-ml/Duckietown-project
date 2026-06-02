@@ -222,6 +222,13 @@ class ObjectDetectionAgent:
         cls_conf     = class_scores[np.arange(len(class_scores)), cls_ids]
         scores       = obj_conf * cls_conf
 
+        if self.frame_count % 30 == 0 and len(scores) > 0:
+            top_idx = int(np.argmax(scores))
+            print(f"[ObjectDetection] frame={self.frame_count} "
+                  f"max_score={scores[top_idx]:.3f} cls={int(cls_ids[top_idx])} "
+                  f"max_obj_conf={obj_conf.max():.3f} "
+                  f"#above_thresh={int((scores >= self.conf_threshold).sum())}")
+
         mask        = scores >= self.conf_threshold
         predictions = predictions[mask]
         scores      = scores[mask]

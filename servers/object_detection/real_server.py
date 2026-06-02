@@ -41,6 +41,11 @@ _detection_lock  = threading.Lock()
 _stopped_by_det  = False
 _stop_reason     = ''
 
+# Eased speed multiplier for smooth decel/accel (see virtual_server.py).
+_speed_scale     = 1.0
+_DECEL_ALPHA     = 0.18
+_SPEED_SNAP      = 0.02
+
 keys_pressed      = {'up': False, 'down': False, 'left': False, 'right': False}
 _keys_lock        = threading.Lock()
 _keys_last_update = time.time()
@@ -100,7 +105,7 @@ def _should_stop(detections, frame_h: int):
 
 
 def visualize(frame_bgr):
-    global _stopped_by_det, _stop_reason
+    global _stopped_by_det, _stop_reason, _speed_scale
 
     if wheels is None:
         return draw_status_overlay(frame_bgr, 'Initializing...')
@@ -121,6 +126,7 @@ def visualize(frame_bgr):
     if manual_mode:
         _stopped_by_det = False
         _stop_reason    = ''
+        _speed_scale    = 1.0
     elif lane_agent is not None:
         pwm_left, pwm_right = lane_agent.compute_commands(frame_rgb)
 
@@ -128,10 +134,12 @@ def visualize(frame_bgr):
         _stopped_by_det = should_stop
         _stop_reason    = reason
 
-        if running and not should_stop:
-            wheels.set_wheels_speed(pwm_left, pwm_right)
-        else:
-            wheels.set_wheels_speed(0.0, 0.0)
+        target = 0.0 if (should_stop or not running) else 1.0
+        _speed_scale += (target - _speed_scale) * _DECEL_ALPHA
+        if _speed_scale < _SPEED_SNAP:
+            _speed_scale = 0.0
+
+        wheels.set_wheels_speed(pwm_left * _speed_scale, pwm_right * _speed_scale)
 
     if det_agent is not None and det_agent.model_loaded and detections:
         oh, ow = frame_bgr.shape[:2]

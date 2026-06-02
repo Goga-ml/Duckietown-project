@@ -41,6 +41,12 @@ _detection_lock  = threading.Lock()
 _stopped_by_det  = False
 _stop_reason     = ''
 
+# Eased speed multiplier. Lerps toward 1.0 while clear and toward 0.0 while
+# should_stop is True, giving a smooth decel/accel instead of a hard cut.
+_speed_scale     = 1.0
+_DECEL_ALPHA     = 0.18  # per-frame lerp rate; ~5 frames to reach near-target
+_SPEED_SNAP      = 0.02  # snap to 0 below this so the wheels actually stop
+
 keys_pressed     = {'up': False, 'down': False, 'left': False, 'right': False}
 _keys_lock       = threading.Lock()
 _keys_last_update = time.time()
@@ -106,7 +112,7 @@ def _should_stop(detections):
 
 
 def visualize(frame_rgb):
-    global _stopped_by_det, _stop_reason
+    global _stopped_by_det, _stop_reason, _speed_scale
 
     bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
@@ -127,6 +133,7 @@ def visualize(frame_rgb):
     if manual_mode:
         _stopped_by_det = False
         _stop_reason    = ''
+        _speed_scale    = 1.0
     elif lane_agent is not None:
         pwm_left, pwm_right = lane_agent.compute_commands(frame_rgb)
 
@@ -134,10 +141,12 @@ def visualize(frame_rgb):
         _stopped_by_det = should_stop_flag
         _stop_reason    = reason
 
-        if running and not should_stop_flag and not wheels.is_game_over():
-            wheels.set_wheels_speed(pwm_left, pwm_right)
-        else:
-            wheels.set_wheels_speed(0.0, 0.0)
+        target = 0.0 if (should_stop_flag or not running or wheels.is_game_over()) else 1.0
+        _speed_scale += (target - _speed_scale) * _DECEL_ALPHA
+        if _speed_scale < _SPEED_SNAP:
+            _speed_scale = 0.0
+
+        wheels.set_wheels_speed(pwm_left * _speed_scale, pwm_right * _speed_scale)
 
     if det_agent is not None and det_agent.model_loaded and detections:
         oh, ow = bgr.shape[:2]
@@ -177,12 +186,13 @@ def stop():
 
 @app.route('/reset', methods=['POST'])
 def reset():
-    global _stopped_by_det, _stop_reason, _last_detections, running
+    global _stopped_by_det, _stop_reason, _last_detections, running, _speed_scale
     if wheels:
         wheels.reset_game()
     _stopped_by_det = False
     _stop_reason    = ''
     running         = True
+    _speed_scale    = 0.0  # accelerate from rest after a reset
     with _detection_lock:
         _last_detections = []
     return jsonify({'status': 'reset', 'running': running})
