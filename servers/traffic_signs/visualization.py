@@ -57,6 +57,35 @@ def draw_active_banner(image_bgr: np.ndarray, active: dict) -> np.ndarray:
     return out
 
 
+# Colour per behaviour state (BGR), so the operator can read the state machine
+# at a glance from the video feed.
+_STATE_COLORS = {
+    "DRIVING":                  (60, 200, 60),    # green: cruising
+    "APPROACHING_SIGN":         (0, 200, 255),    # amber: slowing down
+    "STOPPED":                  (60, 60, 220),    # red: stopped at a sign
+    "WAITING_FOR_RIGHT_OF_WAY": (0, 140, 255),    # orange: giving way
+    "TURNING":                  (220, 170, 50),   # blue: executing a turn
+    "OBSTACLE_STOP":            (60, 60, 220),    # red: blocked
+}
+
+
+def draw_behavior_state(image_bgr: np.ndarray, state: str, note: str = "",
+                        y: int = 44) -> np.ndarray:
+    """Draw the behaviour state machine's current state + note under the active
+    sign banner (top-left), colour-coded by state."""
+    out = image_bgr
+    text = f"STATE: {state}"
+    if note:
+        text += f"  |  {note}"
+    color = _STATE_COLORS.get(state, (200, 200, 200))
+
+    (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+    cv2.rectangle(out, (8, y), (8 + tw + 12, y + th + baseline + 8), (0, 0, 0), -1)
+    cv2.putText(out, text, (14, y + th + 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+    return out
+
+
 def draw_status_overlay(image_bgr: np.ndarray, message: str) -> np.ndarray:
     out = image_bgr.copy()
     pad = 10

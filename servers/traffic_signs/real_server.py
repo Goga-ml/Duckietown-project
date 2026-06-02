@@ -16,7 +16,20 @@ from flask import Flask, Response, render_template_string, jsonify, request
 from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
 from tasks.traffic_signs.packages.agent import TrafficSignAgent
 from tasks.traffic_signs.packages import detection_activity as student
-from servers.traffic_signs.visualization import draw_signs, draw_active_banner, draw_status_overlay
+from tasks.traffic_signs.packages.state_machine import (
+    TrafficSignStateMachine, MotionController, BehaviorConfig,
+    Surroundings, reset_lane_follower, DRIVING, APPROACHING_SIGN,
+)
+try:
+    from tasks.traffic_signs.packages.sensors import SurroundingsSensor
+except Exception as _sensor_import_err:   # e.g. object_detection package absent
+    SurroundingsSensor = None
+    print('[Init] Surroundings sensor unavailable '
+          f'({_sensor_import_err}); obstacle-stop & right-of-way DISABLED, '
+          'sign behaviours still active.')
+from servers.traffic_signs.visualization import (
+    draw_signs, draw_active_banner, draw_status_overlay, draw_behavior_state,
+)
 from servers.templates.traffic_signs import TRAFFIC_SIGNS_TEMPLATE as HTML_TEMPLATE
 
 from duckiebot.camera_driver import CameraDriver
@@ -39,6 +52,19 @@ _frame_queue     = queue.Queue(maxsize=1)
 _last_detections = []
 _active_sign     = None
 _detection_lock  = threading.Lock()
+
+# --- Behaviour layer (Person B): state machine + smooth motion + sensing ---
+sign_sm          = None                 # TrafficSignStateMachine (decision logic)
+motion           = None                 # MotionController (smooth wheel speeds)
+surround_sensor  = None                 # SurroundingsSensor (obstacle / robot-on-right)
+
+_obstacle_queue    = queue.Queue(maxsize=1)
+_surroundings      = Surroundings.clear()
+_surroundings_lock = threading.Lock()
+
+_last_tick_t     = None                 # monotonic time of the previous control tick
+_prev_state      = DRIVING              # to detect resume edges and reset lane PD
+_control_lock    = threading.Lock()     # serialises the per-tick control + wheel writes
 
 keys_pressed      = {'up': False, 'down': False, 'left': False, 'right': False}
 _keys_lock        = threading.Lock()
@@ -66,7 +92,9 @@ def manual_control_loop():
         elif kc['left']:               left, right = -0.3, 0.3
         elif kc['right']:              left, right = 0.3, -0.3
 
-        wheels.set_wheels_speed(left, right)
+        with _control_lock:
+            if manual_mode:           # re-check: /set_mode may have switched us
+                wheels.set_wheels_speed(left, right)
         time.sleep(0.05)
 
 
@@ -88,32 +116,83 @@ def detection_loop():
                 _active_sign     = active
 
 
+def obstacle_loop():
+    """Background detection of obstacles / other robots, mirroring the sign
+    detection_loop. Runs the (heavy) object-detection model off the video
+    thread and publishes the latest Surroundings snapshot."""
+    global _surroundings
+    while not stop_event.is_set():
+        if surround_sensor is None or not surround_sensor.model_loaded:
+            time.sleep(0.1)
+            continue
+        try:
+            frame_rgb = _obstacle_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        surr = surround_sensor.update(frame_rgb)
+        with _surroundings_lock:
+            _surroundings = surr
+
+
 def visualize(frame_bgr):
+    global _last_tick_t, _prev_state
+
     if wheels is None:
         return draw_status_overlay(frame_bgr, 'Initializing...')
 
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
+    # Hand frames to the two async detectors (lossy queues: newest frame wins).
     if sign_agent is not None:
         try:
             _frame_queue.put_nowait(frame_rgb)
+        except queue.Full:
+            pass
+    if surround_sensor is not None and surround_sensor.model_loaded:
+        try:
+            _obstacle_queue.put_nowait(frame_rgb)
         except queue.Full:
             pass
 
     with _detection_lock:
         detections = list(_last_detections)
         active     = _active_sign
+    with _surroundings_lock:
+        surr = _surroundings
 
     if manual_mode:
-        pass
-    elif lane_agent is not None:
-        pwm_left, pwm_right = lane_agent.compute_commands(frame_rgb)
-        target = 0.0 if not running else 1.0
-        wheels.set_wheels_speed(pwm_left * target, pwm_right * target)
+        pass  # the manual_control_loop owns the wheels in manual mode
+    elif lane_agent is not None and sign_sm is not None and motion is not None:
+        # Serialise the whole control section so a second /video stream or a
+        # route thread can't interleave dt / state / wheel writes.
+        with _control_lock:
+            # Time since the last control tick (clamped so a stalled feed can't
+            # produce a huge step that defeats the smooth-motion slew limiter).
+            now = time.monotonic()
+            dt  = (now - _last_tick_t) if _last_tick_t is not None else 0.05
+            _last_tick_t = now
+            dt = max(0.01, min(0.2, dt))
+
+            if not running:
+                wheels.set_wheels_speed(0.0, 0.0)  # held stopped until /start
+            else:
+                # The lane agent provides steering for DRIVING / APPROACHING.
+                lane_cmd = lane_agent.compute_commands(frame_rgb)
+                cmd = sign_sm.update(active, surr, dt)
+                # On the edge back into DRIVING (from a stop/turn/obstacle), clear
+                # the lane agent's stale PD state so it doesn't lurch.
+                if sign_sm.state == DRIVING and _prev_state not in (DRIVING, APPROACHING_SIGN):
+                    reset_lane_follower(lane_agent)
+                _prev_state = sign_sm.state
+                left, right = motion.step(cmd, lane_cmd, dt)
+                if running:            # honour a /stop that raced this tick
+                    wheels.set_wheels_speed(left, right)
 
     if detections:
         draw_signs(frame_bgr, detections)
     draw_active_banner(frame_bgr, active)
+    if sign_sm is not None:
+        draw_behavior_state(frame_bgr, sign_sm.state, sign_sm.note)
     return frame_bgr
 
 
@@ -128,27 +207,51 @@ def index():
 def video():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
+def _reset_behavior():
+    """Return the behaviour layer to a clean DRIVING-from-rest state so we never
+    resume mid-manoeuvre and the next launch ramps up smoothly from zero. Always
+    call this while holding _control_lock (it touches the shared snapshot)."""
+    global _prev_state, _last_tick_t, _surroundings
+    if sign_sm is not None:
+        sign_sm.reset()
+    if motion is not None:
+        motion.reset()
+    if surround_sensor is not None:
+        surround_sensor.reset()
+    reset_lane_follower(lane_agent)
+    with _surroundings_lock:
+        _surroundings = Surroundings.clear()   # don't gate the first tick on stale data
+    _prev_state  = DRIVING
+    _last_tick_t = None
+
+
 @app.route('/start', methods=['POST'])
 def start():
     global running
-    running = True
+    with _control_lock:
+        _reset_behavior()
+        running = True
     return jsonify({'status': 'running'})
 
 @app.route('/stop', methods=['POST'])
 def stop():
     global running
-    running = False
-    if wheels:
-        wheels.set_wheels_speed(0.0, 0.0)
+    with _control_lock:
+        running = False
+        if wheels:
+            wheels.set_wheels_speed(0.0, 0.0)
+        _reset_behavior()
     return jsonify({'status': 'stopped'})
 
 @app.route('/set_mode', methods=['POST'])
 def set_mode():
     global manual_mode
     mode = request.json.get('mode', 'auto') if request.json else 'auto'
-    manual_mode = (mode == 'manual')
-    if wheels and not manual_mode:
-        wheels.set_wheels_speed(0.0, 0.0)
+    with _control_lock:
+        manual_mode = (mode == 'manual')
+        if wheels and not manual_mode:
+            wheels.set_wheels_speed(0.0, 0.0)
+            _reset_behavior()
     return jsonify({'mode': 'manual' if manual_mode else 'auto'})
 
 @app.route('/keys', methods=['POST'])
@@ -166,6 +269,8 @@ def status():
     with _detection_lock:
         dets = list(_last_detections)
         active = _active_sign
+    with _surroundings_lock:
+        surr = _surroundings
     return jsonify({
         'running':        running,
         'manual_mode':    manual_mode,
@@ -173,6 +278,13 @@ def status():
         'load_error':     sign_agent.load_error if sign_agent else None,
         'family':         sign_agent.family if sign_agent else None,
         'active_sign':    active,
+        # Behaviour state machine (Person B).
+        'behavior_state': sign_sm.state if sign_sm else None,
+        'behavior_note':  sign_sm.note if sign_sm else None,
+        'chosen_turn':    sign_sm.chosen_turn if sign_sm else None,
+        'obstacle_ahead': surr.obstacle_ahead,
+        'robot_on_right': surr.robot_on_right,
+        'sensor_ready':   surround_sensor is not None and surround_sensor.model_loaded,
         'detections': [
             {'tag_id': d.tag_id, 'sign_type': d.sign_type, 'distance_m': d.distance_m,
              'turns': d.turns, 'offset_norm': d.offset_norm}
@@ -182,7 +294,7 @@ def status():
 
 
 def main():
-    global lane_agent, sign_agent, camera, wheels
+    global lane_agent, sign_agent, camera, wheels, sign_sm, motion
 
     import argparse
     ap = argparse.ArgumentParser()
@@ -191,8 +303,13 @@ def main():
 
     suppress_http_logs()
     print('=' * 60)
-    print('TRAFFIC SIGNS — LANE FOLLOW + APRILTAG SIGN RECOGNITION')
+    print('TRAFFIC SIGNS — LANE FOLLOW + SIGN BEHAVIOUR STATE MACHINE')
     print('=' * 60)
+
+    # Behaviour layer: lightweight, no hardware deps, so build it up-front.
+    beh_cfg = BehaviorConfig.from_yaml()
+    sign_sm = TrafficSignStateMachine(beh_cfg)
+    motion  = MotionController(beh_cfg)
 
     def _init_wheels():
         global wheels
@@ -207,16 +324,35 @@ def main():
         print('[Init] Camera ready')
 
     def _init_agents():
-        global lane_agent, sign_agent
+        global lane_agent, sign_agent, surround_sensor
         lane_agent = LaneServoingAgent()
         print(f'[Init] Lane agent ready (speed={lane_agent.base_speed})')
         sign_agent = TrafficSignAgent()
         print(f'[Init] Sign agent ready (family={sign_agent.family})')
+        # Obstacle / right-of-way sensing reuses the object-detection model.
+        # If the module or model is missing the sensor stays absent / reports
+        # "all clear" and the sign behaviours still work — only obstacle-stop &
+        # right-of-way go inert.
+        if SurroundingsSensor is None:
+            print('[Init] Surroundings sensor module unavailable '
+                  '-> obstacle-stop & right-of-way DISABLED (signs still active).')
+        else:
+            try:
+                surround_sensor = SurroundingsSensor()
+                if surround_sensor.model_loaded:
+                    print('[Init] Surroundings sensor ready (obstacle + right-of-way)')
+                else:
+                    print('[Init] Surroundings sensor: object-detection model unavailable '
+                          '-> obstacle-stop & right-of-way DISABLED (signs still active). '
+                          'Place best.onnx at tasks/object_detection/models/ to enable.')
+            except Exception as e:
+                print(f'[Init] Surroundings sensor init failed: {e}')
 
     threading.Thread(target=_init_wheels,        daemon=True).start()
     threading.Thread(target=_init_camera,        daemon=True).start()
     threading.Thread(target=_init_agents,        daemon=True).start()
     threading.Thread(target=detection_loop,      daemon=True).start()
+    threading.Thread(target=obstacle_loop,       daemon=True).start()
     threading.Thread(target=manual_control_loop, daemon=True).start()
 
     def _shutdown(signum, frame):

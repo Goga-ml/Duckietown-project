@@ -39,3 +39,49 @@ tag:
   # Physical side length of the printed sign AprilTag, in metres.
   # Duckietown street-sign tags are 6.5 cm by default. Measure yours!
   size_m: 0.065
+
+# ---------------------------------------------------------------------------
+# Behaviour layer (Person B) — the state machine in
+# tasks/traffic_signs/packages/state_machine.py reads this block. Keys map 1:1
+# to BehaviorConfig fields; anything omitted falls back to the dataclass
+# defaults. Ships to the bot on every --run (config/ is packaged).
+# ---------------------------------------------------------------------------
+behavior:
+  # --- Sign approach / stop timing (metres / seconds) ---
+  approach_distance_m: 0.60   # start reacting to a sign at this forward range
+  at_sign_distance_m:  0.30   # "arrived" range (keep == perception AT_SIGN_DISTANCE_M)
+  stop_pause_s:        2.0     # how long to sit still at a stop sign
+  yield_creep_scale:   0.40    # min speed fraction while creeping past a yield
+  cruise_scale:        1.0     # lane-follow speed scale while just driving
+  cooldown_s:          3.0     # min hold on the "just handled this sign" latch
+  lost_grace_s:        0.5     # sign vanished right at the bot -> treat as arrived
+  right_of_way_max_wait_s: 5.0 # give way to a robot on the right, then proceed (no deadlock)
+
+  # --- Open-loop intersection turns (CALIBRATE ON YOUR ROBOT/TRACK) ---
+  # Normalized wheel speeds in [-1, 1] held for duration_s. Tune duration to a
+  # ~90 deg turn and the L/R split to your turn radius. Open-loop (timed) so it
+  # needs no encoders and works identically in sim and on hardware.
+  turn_left_left:      0.00
+  turn_left_right:     0.32
+  turn_left_s:         1.6
+  turn_right_left:     0.32
+  turn_right_right:    0.00
+  turn_right_s:        1.6
+  turn_straight_left:  0.28
+  turn_straight_right: 0.28
+  turn_straight_s:     1.2
+
+  # --- Motion smoothing (the "no jerky stops" guarantee) ---
+  max_accel: 2.0    # max change in a wheel command per second (slew-rate limit)
+  snap_zero: 0.03   # a near-zero target below this snaps to a hard 0 (real stop)
+
+  # --- Obstacle / other-robot sensing (object_detection YOLO) ---
+  # Used by sensors.SurroundingsSensor. Obstacle-ahead reuses object_detection's
+  # should_stop() hysteresis as-is; these tune the "robot on my right" check,
+  # all in the detector's square img_size pixel space (fractions of img_size).
+  right_of_way_min_cx:        0.55  # bbox centre must be right of this (0=left,1=right)
+  right_of_way_max_cx:        1.00  # ...and left of this (ignore far frame edge if <1)
+  right_of_way_min_area:      0.010 # bbox area / frame area — ignore tiny/far blobs
+  right_of_way_bottom_min:    0.25  # bbox bottom must reach this fraction (near enough)
+  right_of_way_frames_to_set: 2     # consecutive sightings before "robot present"
+  right_of_way_frames_to_clear: 4   # consecutive misses before "right is clear"
