@@ -1,0 +1,41 @@
+# Traffic-sign perception (AprilTag) configuration.
+#
+# Person A owns this file. It tunes the AprilTag detector and the geometry
+# used to turn a tag into a "sign type + distance" signal that Person B's
+# behaviour/state-machine consumes.
+
+detector:
+  # Duckietown traffic signs are printed with the tag36h11 family.
+  # (cv2.aruco DICT_APRILTAG_36h11 decodes the identical family.)
+  family: "tag36h11"
+
+  # >1.0 downsamples the image before quad detection: faster, but loses
+  # range on small/far tags. 1.0 = full resolution (best range, slowest).
+  quad_decimate: 1.0
+
+  # Sharpens quad corners. Higher = more accurate corners on blurry frames
+  # at some CPU cost. 0.0 disables.
+  quad_sigma: 0.0
+
+  # Reject candidate quads whose perimeter is below this fraction of the
+  # max(image width, height). This is the first line of defence against
+  # spurious far-away / background detections.
+  min_marker_perimeter_rate: 0.03
+
+camera:
+  # Pinhole intrinsics for the 640x480 stream, used for distance/pose.
+  # These are reasonable defaults for a *rectified* Duckiebot camera; for
+  # accurate distance replace them with your own camera-calibration output
+  # (see tasks/visual_lane_servoing/notebooks/03-Camera-Calibration).
+  fx: 340.0
+  fy: 340.0
+  cx: 320.0
+  cy: 240.0
+  # Distortion coefficients [k1, k2, p1, p2, k3]. Leave at zero if you feed
+  # the detector an already-rectified frame.
+  dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+tag:
+  # Physical side length of the printed sign AprilTag, in metres.
+  # Duckietown street-sign tags are 6.5 cm by default. Measure yours!
+  size_m: 0.065

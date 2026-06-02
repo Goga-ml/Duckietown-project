@@ -18,6 +18,9 @@ GODOT_SCENES = {
     'modcon': 'res://scenes/Modconpath.tscn',
     'navigator': 'res://scenes/map_follower.tscn',
     'object_detection': 'res://scenes/lane_detect.tscn',
+    # Traffic-sign recognition reuses the lane-following map for --sim (the sim
+    # has no AprilTags; signs only appear when running on hardware).
+    'traffic_signs': 'res://scenes/lane_detect.tscn',
 }
 
 DEFAULT_WEB_PORT = 5000
