@@ -41,11 +41,13 @@ from flask import Flask, Response, render_template_string, jsonify, request
 
 from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
 from tasks.traffic_signs.packages.agent import TrafficSignAgent
+from dataclasses import replace as _dc_replace
 from tasks.traffic_signs.packages import detection_activity as student
 from tasks.traffic_signs.packages.state_machine import (
     TrafficSignStateMachine, MotionController, BehaviorConfig,
     Surroundings, reset_lane_follower, DRIVING, APPROACHING_SIGN,
 )
+from tasks.traffic_signs.packages.stop_line import StopLineDetector
 try:
     from tasks.traffic_signs.packages.sensors import SurroundingsSensor
 except Exception as _sensor_import_err:   # object_detection package/model absent
@@ -68,7 +70,7 @@ from servers.common import make_frame_generator, shutdown_cleanup, suppress_http
 try:
     from servers.traffic_signs.visualization import (
         draw_signs, draw_active_banner, draw_status_overlay, draw_behavior_state,
-        draw_lane_overlay,
+        draw_lane_overlay, draw_stop_line,
     )
 except Exception:
     _STATE_COLORS = {
@@ -109,6 +111,19 @@ except Exception:
         cv2.putText(out, message, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     (0, 200, 255), 1, cv2.LINE_AA)
         return out
+
+    def draw_stop_line(img, detector):
+        if detector is None:
+            return img
+        h, w = img.shape[:2]
+        x0, x1 = int(w * detector.roi_x0), int(w * detector.roi_x1)
+        y0 = int(h * detector.roi_top)
+        hit = detector.last_ratio >= detector.min_area_ratio
+        color = (0, 0, 255) if hit else (120, 120, 120)
+        cv2.rectangle(img, (x0, y0), (x1, h - 1), color, 2)
+        cv2.putText(img, f"stop-line {detector.last_ratio:.2f}" + (" REACHED" if hit else ""),
+                    (x0 + 4, max(12, y0 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+        return img
 
     def draw_lane_overlay(img, lane_dbg, tol=5):
         if not lane_dbg:
@@ -192,10 +207,12 @@ _detection_lock  = threading.Lock()
 sign_sm          = None
 motion           = None
 surround_sensor  = None
+stop_line_det    = StopLineDetector()   # red stop-line detector (no heavy deps)
 
 _obstacle_queue    = queue.Queue(maxsize=1)
 _surroundings      = Surroundings.clear()
 _surroundings_lock = threading.Lock()
+_stop_line_ahead   = False              # last red-line reading (for /status)
 
 _last_tick_t  = None
 _prev_state   = DRIVING
@@ -267,7 +284,7 @@ def obstacle_loop():
 
 
 def visualize(frame_bgr):
-    global _last_tick_t, _prev_state
+    global _last_tick_t, _prev_state, _stop_line_ahead
 
     if wheels is None:
         return draw_status_overlay(frame_bgr, 'Initializing...')
@@ -285,11 +302,15 @@ def visualize(frame_bgr):
         except queue.Full:
             pass
 
+    # Red stop-line detection runs inline (cheap) for low-latency turn timing.
+    _stop_line_ahead = stop_line_det.detect(frame_rgb)
+
     with _detection_lock:
         detections = list(_last_detections)
         active     = _active_sign
     with _surroundings_lock:
         surr = _surroundings
+    surr = _dc_replace(surr, stop_line_ahead=_stop_line_ahead)
 
     lane_dbg = None
     if manual_mode:
@@ -328,6 +349,7 @@ def visualize(frame_bgr):
 
     if lane_dbg is not None:
         draw_lane_overlay(frame_bgr, lane_dbg)
+    draw_stop_line(frame_bgr, stop_line_det)
     if detections:
         draw_signs(frame_bgr, detections)
     draw_active_banner(frame_bgr, active)
@@ -433,6 +455,7 @@ def status():
         'chosen_turn':    sign_sm.chosen_turn if sign_sm else None,
         'obstacle_ahead': surr.obstacle_ahead,
         'robot_on_right': surr.robot_on_right,
+        'stop_line':      _stop_line_ahead,
         'sensor_ready':   surround_sensor is not None and surround_sensor.model_loaded,
         'detections': [
             {'tag_id': d.tag_id, 'sign_type': d.sign_type, 'distance_m': d.distance_m,

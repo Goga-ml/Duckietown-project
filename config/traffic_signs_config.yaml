@@ -53,6 +53,12 @@ behavior:
   stop_pause_s:        2.0     # how long to sit still at a stop sign
   yield_creep_scale:   0.40    # min speed fraction while creeping past a yield
   cruise_scale:        1.0     # lane-follow speed scale while just driving
+  # Turn-option/stop signs sit BEFORE the junction: after seeing one, the bot
+  # keeps lane-following at this speed until it reaches the red stop line, then
+  # acts (stops / turns) — like real traffic. Raise approach_line_scale toward
+  # cruise for a brisker roll-up; lower it to creep more cautiously.
+  approach_line_scale: 0.8     # lane-follow speed while rolling up to the stop line
+  line_search_max_s:   6.0     # if no red stop line is seen by now, act anyway (failsafe)
   cooldown_s:          3.0     # min hold on the "just handled this sign" latch
   lost_grace_s:        0.5     # sign vanished right at the bot -> treat as arrived
   right_of_way_max_wait_s: 5.0 # give way to a robot on the right, then proceed (no deadlock)
@@ -85,3 +91,19 @@ behavior:
   right_of_way_bottom_min:    0.25  # bbox bottom must reach this fraction (near enough)
   right_of_way_frames_to_set: 2     # consecutive sightings before "robot present"
   right_of_way_frames_to_clear: 4   # consecutive misses before "right is clear"
+
+# ---------------------------------------------------------------------------
+# Red stop-line detection (tasks/traffic_signs/packages/stop_line.py). The red
+# line painted across the lane marks the end of the current road; the bot acts
+# on a latched sign only once it reaches this line. Tune the red HSV thresholds
+# to your lighting and min_area_ratio to how close "reached" should be.
+# ---------------------------------------------------------------------------
+stop_line:
+  roi_top:        0.65   # ROI = this fraction of frame height .. bottom
+  roi_x0:         0.15   # ROI left edge  (fraction of width)
+  roi_x1:         0.85   # ROI right edge (fraction of width)
+  h_lo:           10     # red hue: [0..h_lo] U [h_hi..179]
+  h_hi:           170
+  s_min:          90     # min saturation (reject pale/orange)
+  v_min:          70     # min value (reject dark)
+  min_area_ratio: 0.06   # red must fill >= this fraction of the ROI to count

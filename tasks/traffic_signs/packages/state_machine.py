@@ -65,6 +65,7 @@ class Surroundings:
     """
     obstacle_ahead: bool = False   # something blocking the lane straight ahead
     robot_on_right: bool = False   # another vehicle to our right (right-of-way)
+    stop_line_ahead: bool = False  # red stop line (end of road) reached
     obstacle_reason: str = ""      # human-readable label for logging/overlay
 
     @classmethod
@@ -102,10 +103,12 @@ class BehaviorConfig:
     approach_distance_m: float = 0.60   # start reacting to a sign at this range
     at_sign_distance_m:  float = 0.30   # "arrived" range (matches perception)
     stop_pause_s:        float = 2.0    # dwell time at a stop sign
-    yield_creep_scale:   float = 0.40   # min speed while creeping past a yield
+    yield_creep_scale:   float = 0.40   # speed while creeping toward a yield line
     cruise_scale:        float = 1.0    # lane-follow speed scale when DRIVING
+    approach_line_scale: float = 0.8    # lane-follow speed while rolling to the stop line
+    line_search_max_s:   float = 6.0    # if no stop line is found by now, act anyway
     cooldown_s:          float = 3.0    # min hold on the handled-sign latch
-    lost_grace_s:        float = 0.5    # sign vanished near bot -> treat arrived
+    lost_grace_s:        float = 0.5    # (unused; kept for config compat)
     right_of_way_max_wait_s: float = 5.0  # give way then proceed (no deadlock)
 
     # --- Open-loop turns (NORMALIZED wheel speeds + durations) -----------
@@ -233,46 +236,42 @@ class TrafficSignStateMachine:
                 and active['distance_m'] <= self.cfg.approach_distance_m:
             kind = self._classify(active)
             if kind is not None:
+                # Latch the action now (the sign passes out of view as we close
+                # in), but DON'T act yet: keep lane-following until we reach the
+                # red stop line that marks the end of the road.
                 self._sign_kind = kind
                 self._target_tag = active['tag_id']
                 self._chosen_turn = (self._rng.choice(active['turns'])
                                      if kind == 'intersection' else None)
-                self._lost_time = 0.0
-                self._last_dist = active['distance_m']
                 turn_txt = f" -> turn {self._chosen_turn}" if self._chosen_turn else ""
-                return self._goto(APPROACHING_SIGN, f"approaching {kind}{turn_txt}",
-                                  self._cmd_approach(active))
+                return self._goto(APPROACHING_SIGN, f"{kind}{turn_txt}: to stop line",
+                                  self._cmd_lane(self._approach_speed()))
 
         self.note = "driving"
         return self._cmd_lane(self.cfg.cruise_scale)
 
-    # APPROACHING_SIGN: decelerate smoothly while still steering with the lane
-    # agent. We slow in proportion to the remaining distance so the bot eases
-    # to a halt right at the sign rather than braking suddenly. When the sign
-    # is reached (or vanishes from view because we're right on top of it),
-    # branch by sign type.
+    # APPROACHING_SIGN: the action is already latched. Keep lane-following at a
+    # measured speed until the red stop line that marks the end of the road,
+    # THEN act — so a turn happens at the intersection, not at the sign (which
+    # sits well before it). The sign itself may leave the camera view on the way
+    # in; that's fine, we no longer depend on it.
     def _h_approaching(self, active, surr, dt) -> DriveCommand:
         if surr.obstacle_ahead:
             return self._goto(OBSTACLE_STOP, f"obstacle: {surr.obstacle_reason}",
                               self._cmd_halt())
 
-        if active is not None:
-            self._lost_time = 0.0
-            self._last_dist = active['distance_m']
-            arrived = active['at_sign'] or active['distance_m'] <= self.cfg.at_sign_distance_m
-            scale = self._approach_scale(active['distance_m'])
-        else:
-            # Sign dropped out of view. Near a sign this means it slipped above
-            # the camera, so keep decelerating and treat as arrived after a
-            # short grace (also rides out 1-frame perception dropouts).
-            self._lost_time += dt
-            arrived = self._lost_time >= self.cfg.lost_grace_s
-            scale = 0.0
-
-        if arrived:
+        if surr.stop_line_ahead:
+            self.note = "stop line reached"
             return self._on_arrival()
 
-        return self._cmd_lane(scale)
+        # Safety net: if the line is never detected (faded paint, none painted),
+        # act anyway after a bounded search instead of driving on forever.
+        if self._state_time >= self.cfg.line_search_max_s:
+            self.note = "no stop line found; acting"
+            return self._on_arrival()
+
+        self.note = f"{self._sign_kind}: approaching stop line"
+        return self._cmd_lane(self._approach_speed())
 
     # STOPPED: full stop at a stop/intersection sign. Hold zero speed for the
     # configured pause, then go check right-of-way before proceeding.
@@ -355,15 +354,11 @@ class TrafficSignStateMachine:
             return 'yield'
         return None  # t-light-ahead, pedestrian, parking, ... -> just drive
 
-    def _approach_scale(self, distance_m) -> float:
-        """Linear speed ramp: 1.0 at approach_distance down to 0.0 at the sign.
-        Yield signs keep a creep floor instead of stopping."""
-        a, b = self.cfg.approach_distance_m, self.cfg.at_sign_distance_m
-        scale = (distance_m - b) / max(1e-3, (a - b))
-        scale = max(0.0, min(1.0, scale))
-        if self._sign_kind == 'yield':
-            scale = max(scale, self.cfg.yield_creep_scale)
-        return scale
+    def _approach_speed(self) -> float:
+        """Lane-follow speed while rolling toward the stop line. Yields creep in
+        slower (ready to give way); stop/intersection roll at the approach speed."""
+        return (self.cfg.yield_creep_scale if self._sign_kind == 'yield'
+                else self.cfg.approach_line_scale)
 
     def _turn_params(self):
         c = self.cfg
@@ -412,9 +407,6 @@ class TrafficSignStateMachine:
     def _cmd_turn(self):
         left, right, _duration = self._turn_params()
         return self._cmd_arc(left, right)
-
-    def _cmd_approach(self, active):
-        return self._cmd_lane(self._approach_scale(active['distance_m']))
 
 
 # ---------------------------------------------------------------------------

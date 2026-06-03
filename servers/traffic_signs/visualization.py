@@ -96,6 +96,25 @@ def draw_status_overlay(image_bgr: np.ndarray, message: str) -> np.ndarray:
     return out
 
 
+def draw_stop_line(image_bgr: np.ndarray, detector) -> np.ndarray:
+    """Outline the red stop-line detection ROI and show its current red ratio,
+    so the operator can tune detection on the bot. Turns red when the line is
+    'reached' (ratio >= threshold)."""
+    if detector is None:
+        return image_bgr
+    out = image_bgr
+    h, w = out.shape[:2]
+    x0, x1 = int(w * detector.roi_x0), int(w * detector.roi_x1)
+    y0 = int(h * detector.roi_top)
+    hit = detector.last_ratio >= detector.min_area_ratio
+    color = (0, 0, 255) if hit else (120, 120, 120)
+    cv2.rectangle(out, (x0, y0), (x1, h - 1), color, 2)
+    label = f"stop-line {detector.last_ratio:.2f}/{detector.min_area_ratio:.2f}" + (" REACHED" if hit else "")
+    cv2.putText(out, label, (x0 + 4, max(12, y0 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+    return out
+
+
 def draw_lane_overlay(image_bgr: np.ndarray, lane_dbg: dict, tol: int = 5) -> np.ndarray:
     """Overlay the lane-follower's per-slice sample points so the operator can
     confirm the bot is actually tracking the lane markings.

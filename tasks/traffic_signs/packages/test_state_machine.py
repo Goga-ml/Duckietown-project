@@ -15,6 +15,7 @@ Exit code is non-zero if any check fails.
 """
 
 import sys
+from dataclasses import replace
 
 from tasks.traffic_signs.packages.state_machine import (
     TrafficSignStateMachine, MotionController, BehaviorConfig, Surroundings,
@@ -84,16 +85,22 @@ class Sim:
         return rec
 
     def approach(self, sign_type, turns=None, start=0.58, stop=0.24, step=0.03,
-                 surr=None):
-        """Feed a shrinking-distance approach, one frame per distance.
+                 surr=None, line_frames=3):
+        """Feed a shrinking-distance approach, then arrive at the red stop line.
 
-        ``stop`` goes below the 0.30 m at_sign threshold so the run crosses it
-        and the machine 'arrives' via the normal path (not the lost-sign grace)."""
+        The machine latches the action when it first sees the sign, keeps
+        lane-following, and only acts once it reaches the red stop line — so the
+        approach ends with a few frames carrying ``stop_line_ahead=True`` (the
+        sign is typically out of view by then, hence ``active=None``)."""
+        base = surr or CLEAR
         d = start
         last = None
         while d >= stop - 1e-9:
-            last = self.tick(mk_active(sign_type, d, turns), surr)
+            last = self.tick(mk_active(sign_type, d, turns), base)
             d -= step
+        line_surr = replace(base, stop_line_ahead=True)
+        for _ in range(line_frames):
+            last = self.tick(None, line_surr)
         return last
 
     def states_seen(self):
