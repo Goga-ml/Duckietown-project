@@ -15,7 +15,7 @@ from flask import Flask, Response, render_template_string, jsonify, request
 from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
 from tasks.traffic_signs.packages.agent import TrafficSignAgent
 from tasks.traffic_signs.packages import detection_activity as student
-from servers.traffic_signs.visualization import draw_signs, draw_active_banner
+from servers.traffic_signs.visualization import draw_signs, draw_active_banner, draw_lane_overlay
 from servers.templates.traffic_signs import TRAFFIC_SIGNS_TEMPLATE as HTML_TEMPLATE
 
 from duckiebot.camera_driver.godot_camera_driver import GodotCameraDriver, GodotCameraConfig
@@ -103,13 +103,17 @@ def visualize(frame_rgb):
         detections = list(_last_detections)
         active     = _active_sign
 
+    lane_dbg = None
     if manual_mode:
         pass
     elif lane_agent is not None:
         pwm_left, pwm_right = lane_agent.compute_commands(frame_rgb)
+        lane_dbg = lane_agent.last_debug_info
         target = 0.0 if (not running or wheels.is_game_over()) else 1.0
         wheels.set_wheels_speed(pwm_left * target, pwm_right * target)
 
+    if lane_dbg is not None:
+        draw_lane_overlay(bgr, lane_dbg)
     if detections:
         draw_signs(bgr, detections)
     draw_active_banner(bgr, active)
@@ -161,6 +165,15 @@ def set_mode():
         wheels.set_wheels_speed(0.0, 0.0)
     return jsonify({'mode': 'manual' if manual_mode else 'auto'})
 
+@app.route('/set_speed', methods=['POST'])
+def set_speed():
+    value = request.json.get('value') if request.json else None
+    if lane_agent is not None and value is not None:
+        v = max(0.0, min(1.0, float(value)))
+        lane_agent.base_speed = v
+        lane_agent.curve_speed = v
+    return jsonify({'base_speed': getattr(lane_agent, 'base_speed', None)})
+
 @app.route('/keys', methods=['POST'])
 def update_keys():
     global _keys_last_update
@@ -183,6 +196,7 @@ def status():
         'detector_ready': sign_agent is not None and sign_agent.load_error is None,
         'load_error':     sign_agent.load_error if sign_agent else None,
         'family':         sign_agent.family if sign_agent else None,
+        'base_speed':     getattr(lane_agent, 'base_speed', None) if lane_agent else None,
         'active_sign':    active,
         'detections': [
             {'tag_id': d.tag_id, 'sign_type': d.sign_type, 'distance_m': d.distance_m,

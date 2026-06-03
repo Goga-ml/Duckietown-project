@@ -1,3 +1,26 @@
+"""Hardware entry point for the traffic_signs task — runs ON THE BOT.
+
+The Duckiebot dashboard launches each task from a script shipped *inside* the
+deployed package, at ``tasks/<task>/packages/<task>_server.py``. ``launch.py
+--run`` only packages ``tasks/<task>/packages/`` + ``config/``, so the server
+that runs on the bot must live here, not under ``servers/``.
+
+This file is therefore deliberately **self-contained**: it depends only on
+  * base infra that every Duckiebot repo already has — ``duckiebot`` drivers,
+    ``servers.common``, ``servers.templates.base``, ``launcher.ports``, and the
+    standard ``visual_lane_servoing`` / ``object_detection`` task packages, and
+  * the traffic_signs package modules that ship alongside it (agent,
+    detection_activity, state_machine, sensors, sign_lookup).
+
+The richer overlay/UI from ``servers/traffic_signs`` is used automatically when
+present (i.e. when this repo is checked out on the bot), and otherwise falls
+back to compact inline versions defined below — so it runs either way.
+
+For local development you normally use ``servers/traffic_signs/real_server.py``
+(via the dashboard on your machine); this file mirrors its behaviour and is the
+one that actually executes on the robot.
+"""
+
 import sys
 import os
 import signal
@@ -6,11 +29,14 @@ import time
 import queue
 import socket
 
+# packages/ is three levels below the project root.
 script_dir   = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.join(script_dir, '..', '..')
-sys.path.insert(0, project_root)
+project_root = os.path.normpath(os.path.join(script_dir, '..', '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 import cv2
+import numpy as np
 from flask import Flask, Response, render_template_string, jsonify, request
 
 from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
@@ -22,22 +48,131 @@ from tasks.traffic_signs.packages.state_machine import (
 )
 try:
     from tasks.traffic_signs.packages.sensors import SurroundingsSensor
-except Exception as _sensor_import_err:   # e.g. object_detection package absent
+except Exception as _sensor_import_err:   # object_detection package/model absent
     SurroundingsSensor = None
     print('[Init] Surroundings sensor unavailable '
           f'({_sensor_import_err}); obstacle-stop & right-of-way DISABLED, '
           'sign behaviours still active.')
-from servers.traffic_signs.visualization import (
-    draw_signs, draw_active_banner, draw_status_overlay, draw_behavior_state,
-    draw_lane_overlay,
-)
-from servers.templates.traffic_signs import TRAFFIC_SIGNS_TEMPLATE as HTML_TEMPLATE
 
 from duckiebot.camera_driver import CameraDriver
 from duckiebot.wheel_driver import DaguWheelsDriver
 from duckiebot.wheel_driver.wheels_driver_abs import WheelPWMConfiguration
 from launcher.ports import find_available_port
 from servers.common import make_frame_generator, shutdown_cleanup, suppress_http_logs
+
+
+# ---------------------------------------------------------------------------
+# Visualization + HTML template: use the full versions from servers/ when this
+# repo is on the bot, else fall back to compact self-contained implementations.
+# ---------------------------------------------------------------------------
+try:
+    from servers.traffic_signs.visualization import (
+        draw_signs, draw_active_banner, draw_status_overlay, draw_behavior_state,
+        draw_lane_overlay,
+    )
+except Exception:
+    _STATE_COLORS = {
+        "DRIVING": (60, 200, 60), "APPROACHING_SIGN": (0, 200, 255),
+        "STOPPED": (60, 60, 220), "WAITING_FOR_RIGHT_OF_WAY": (0, 140, 255),
+        "TURNING": (220, 170, 50), "OBSTACLE_STOP": (60, 60, 220),
+    }
+
+    def draw_signs(img, detections):
+        for d in detections:
+            color = (60, 200, 60) if d.sign_type else (160, 160, 160)
+            cv2.polylines(img, [d.corners.astype(np.int32)], True, color, 2)
+            label = f"{d.sign_type or ('id ' + str(d.tag_id))} {d.distance_m:.2f}m"
+            x1, y1 = d.bbox[0], d.bbox[1]
+            cv2.putText(img, label, (x1, max(12, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        return img
+
+    def draw_active_banner(img, active):
+        if not active:
+            return img
+        turns = active.get("turns")
+        txt = (f"ACTIVE: {active['sign_type']} {active['distance_m']}m"
+               + (f" turns={','.join(turns)}" if turns else "")
+               + ("  [AT SIGN]" if active.get("at_sign") else ""))
+        cv2.putText(img, txt, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 220, 255), 2, cv2.LINE_AA)
+        return img
+
+    def draw_behavior_state(img, state, note="", y=44):
+        txt = f"STATE: {state}" + (f"  |  {note}" if note else "")
+        cv2.putText(img, txt, (10, y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    _STATE_COLORS.get(state, (200, 200, 200)), 1, cv2.LINE_AA)
+        return img
+
+    def draw_status_overlay(img, message):
+        out = img.copy()
+        cv2.putText(out, message, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 200, 255), 1, cv2.LINE_AA)
+        return out
+
+    def draw_lane_overlay(img, lane_dbg, tol=5):
+        if not lane_dbg:
+            return img
+        h, w = img.shape[:2]
+        ym = lane_dbg.get('yellow_mask'); wm = lane_dbg.get('white_mask')
+        cv2.line(img, (w // 2, int(h * 0.45)), (w // 2, h), (90, 90, 90), 1)
+        for y in (lane_dbg.get('slice_ys') or []):
+            if not (0 <= y < h):
+                continue
+            for mask, color in ((ym, (0, 255, 255)), (wm, (255, 255, 255))):
+                if mask is None or mask.shape[:2] != (h, w):
+                    continue
+                xs = np.where(mask[max(0, y - tol):y + tol, :] > 0)[1]
+                if len(xs):
+                    mx = int(xs.mean())
+                    cv2.circle(img, (mx, y), 6, color, -1)
+                    cv2.circle(img, (mx, y), 6, (0, 0, 0), 1)
+        detected = bool(lane_dbg.get('lane_detected'))
+        cv2.putText(img, "LANE: tracking" if detected else "LANE: searching",
+                    (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (60, 200, 60) if detected else (0, 170, 255), 2, cv2.LINE_AA)
+        return img
+
+try:
+    from servers.templates.traffic_signs import TRAFFIC_SIGNS_TEMPLATE as HTML_TEMPLATE
+except Exception:
+    HTML_TEMPLATE = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Traffic Signs</title>
+<style>
+body{background:#13161a;color:#e6edf3;font-family:sans-serif;margin:0;padding:16px}
+img{max-width:100%;border-radius:6px}
+button{padding:10px 16px;margin:4px;border:0;border-radius:5px;font-size:14px;cursor:pointer}
+#go{background:#2ea043;color:#fff}#halt{background:#d29922;color:#000}
+#bar{margin:10px 0;font-size:14px}.k{color:#8b949e}
+</style></head><body>
+<h2>Traffic Signs — {{ hostname }}</h2>
+<img src="{{ url_for('video') }}">
+<div id="bar">
+  <button id="go" onclick="post('/start')">Start</button>
+  <button id="halt" onclick="post('/stop')">Stop</button>
+  <span class="k">state:</span> <b id="st">-</b>
+  <span class="k">sign:</span> <b id="sg">-</b>
+  <span class="k">detector:</span> <b id="dr">-</b>
+</div>
+<div id="bar">
+  <span class="k">speed:</span>
+  <input id="sp" type="range" min="0.05" max="0.5" step="0.01" value="0.2" style="vertical-align:middle;width:240px" oninput="onSpeed(this.value)">
+  <b id="spv">0.20</b>
+</div>
+<script>
+function post(u){fetch(u,{method:'POST'});}
+function postJSON(u,d){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});}
+let spDirty=false;
+function onSpeed(v){document.getElementById('spv').textContent=parseFloat(v).toFixed(2);spDirty=true;
+ postJSON('/set_speed',{value:parseFloat(v)}).then(()=>{spDirty=false;});}
+async function poll(){try{let d=await(await fetch('/status')).json();
+ document.getElementById('st').textContent=d.behavior_state||'-';
+ let a=d.active_sign; document.getElementById('sg').textContent=a?(a.sign_type+' '+a.distance_m+'m'):'none';
+ document.getElementById('dr').textContent=d.detector_ready?('ready ('+(d.family||'')+')'):(d.load_error||'…');
+ if(!spDirty && d.base_speed!=null){document.getElementById('sp').value=d.base_speed;document.getElementById('spv').textContent=Number(d.base_speed).toFixed(2);}
+}catch(e){}}
+setInterval(poll,300);poll();
+</script></body></html>"""
 
 
 app        = Flask(__name__)
@@ -54,18 +189,17 @@ _last_detections = []
 _active_sign     = None
 _detection_lock  = threading.Lock()
 
-# --- Behaviour layer (Person B): state machine + smooth motion + sensing ---
-sign_sm          = None                 # TrafficSignStateMachine (decision logic)
-motion           = None                 # MotionController (smooth wheel speeds)
-surround_sensor  = None                 # SurroundingsSensor (obstacle / robot-on-right)
+sign_sm          = None
+motion           = None
+surround_sensor  = None
 
 _obstacle_queue    = queue.Queue(maxsize=1)
 _surroundings      = Surroundings.clear()
 _surroundings_lock = threading.Lock()
 
-_last_tick_t     = None                 # monotonic time of the previous control tick
-_prev_state      = DRIVING              # to detect resume edges and reset lane PD
-_control_lock    = threading.Lock()     # serialises the per-tick control + wheel writes
+_last_tick_t  = None
+_prev_state   = DRIVING
+_control_lock = threading.Lock()
 
 keys_pressed      = {'up': False, 'down': False, 'left': False, 'right': False}
 _keys_lock        = threading.Lock()
@@ -94,7 +228,7 @@ def manual_control_loop():
         elif kc['right']:              left, right = 0.3, -0.3
 
         with _control_lock:
-            if manual_mode:           # re-check: /set_mode may have switched us
+            if manual_mode:
                 wheels.set_wheels_speed(left, right)
         time.sleep(0.05)
 
@@ -118,9 +252,6 @@ def detection_loop():
 
 
 def obstacle_loop():
-    """Background detection of obstacles / other robots, mirroring the sign
-    detection_loop. Runs the (heavy) object-detection model off the video
-    thread and publishes the latest Surroundings snapshot."""
     global _surroundings
     while not stop_event.is_set():
         if surround_sensor is None or not surround_sensor.model_loaded:
@@ -143,7 +274,6 @@ def visualize(frame_bgr):
 
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-    # Hand frames to the two async detectors (lossy queues: newest frame wins).
     if sign_agent is not None:
         try:
             _frame_queue.put_nowait(frame_rgb)
@@ -163,41 +293,34 @@ def visualize(frame_bgr):
 
     lane_dbg = None
     if manual_mode:
-        pass  # the manual_control_loop owns the wheels in manual mode
+        pass
     elif lane_agent is not None and sign_sm is not None and motion is not None:
-        # Serialise the whole control section so a second /video stream or a
-        # route thread can't interleave dt / state / wheel writes.
         with _control_lock:
-            # Time since the last control tick (clamped so a stalled feed can't
-            # produce a huge step that defeats the smooth-motion slew limiter).
             now = time.monotonic()
             dt  = (now - _last_tick_t) if _last_tick_t is not None else 0.05
             _last_tick_t = now
             dt = max(0.01, min(0.2, dt))
 
-            # Always run the lane follower so the overlay can show the lane
-            # points even before /start; only wheel output is gated on `running`.
+            # Always compute lane following (cheap) so the overlay shows what the
+            # bot sees even before /start; only the wheels are gated on `running`.
             lane_cmd = lane_agent.compute_commands(frame_rgb)
             lane_dbg = lane_agent.last_debug_info
 
             if not running:
-                wheels.set_wheels_speed(0.0, 0.0)  # held stopped until /start
+                wheels.set_wheels_speed(0.0, 0.0)
             else:
                 cmd = sign_sm.update(active, surr, dt)
-                # On the edge back into DRIVING (from a stop/turn/obstacle), clear
-                # the lane agent's stale PD state so it doesn't lurch.
                 if sign_sm.state == DRIVING and _prev_state not in (DRIVING, APPROACHING_SIGN):
                     reset_lane_follower(lane_agent)
                 _prev_state = sign_sm.state
                 if cmd.kind == 'lane_follow':
                     # Plain lane following: drive exactly like the
                     # visual_lane_servoing task — apply the lane agent's wheel
-                    # commands directly (no slew limiting) for crisp steering.
-                    # Keep the motion controller synced so a later halt/turn
-                    # still ramps down smoothly from the real speed.
-                    import numpy as _np
-                    left  = float(_np.clip(lane_cmd[0] * cmd.speed_scale, 0.0, 1.0))
-                    right = float(_np.clip(lane_cmd[1] * cmd.speed_scale, 0.0, 1.0))
+                    # commands directly (no slew limiting) so steering stays
+                    # crisp. Keep the motion controller synced so a later
+                    # halt/turn still ramps down smoothly from the real speed.
+                    left  = float(np.clip(lane_cmd[0] * cmd.speed_scale, 0.0, 1.0))
+                    right = float(np.clip(lane_cmd[1] * cmd.speed_scale, 0.0, 1.0))
                     motion.sync(left, right)
                 else:
                     left, right = motion.step(cmd, lane_cmd, dt)
@@ -224,10 +347,8 @@ def index():
 def video():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
+
 def _reset_behavior():
-    """Return the behaviour layer to a clean DRIVING-from-rest state so we never
-    resume mid-manoeuvre and the next launch ramps up smoothly from zero. Always
-    call this while holding _control_lock (it touches the shared snapshot)."""
     global _prev_state, _last_tick_t, _surroundings
     if sign_sm is not None:
         sign_sm.reset()
@@ -237,7 +358,7 @@ def _reset_behavior():
         surround_sensor.reset()
     reset_lane_follower(lane_agent)
     with _surroundings_lock:
-        _surroundings = Surroundings.clear()   # don't gate the first tick on stale data
+        _surroundings = Surroundings.clear()
     _prev_state  = DRIVING
     _last_tick_t = None
 
@@ -307,7 +428,6 @@ def status():
         'family':         sign_agent.family if sign_agent else None,
         'base_speed':     getattr(lane_agent, 'base_speed', None) if lane_agent else None,
         'active_sign':    active,
-        # Behaviour state machine (Person B).
         'behavior_state': sign_sm.state if sign_sm else None,
         'behavior_note':  sign_sm.note if sign_sm else None,
         'chosen_turn':    sign_sm.chosen_turn if sign_sm else None,
@@ -335,7 +455,6 @@ def main():
     print('TRAFFIC SIGNS — LANE FOLLOW + SIGN BEHAVIOUR STATE MACHINE')
     print('=' * 60)
 
-    # Behaviour layer: lightweight, no hardware deps, so build it up-front.
     beh_cfg = BehaviorConfig.from_yaml()
     sign_sm = TrafficSignStateMachine(beh_cfg)
     motion  = MotionController(beh_cfg)
@@ -358,10 +477,6 @@ def main():
         print(f'[Init] Lane agent ready (speed={lane_agent.base_speed})')
         sign_agent = TrafficSignAgent()
         print(f'[Init] Sign agent ready (family={sign_agent.family})')
-        # Obstacle / right-of-way sensing reuses the object-detection model.
-        # If the module or model is missing the sensor stays absent / reports
-        # "all clear" and the sign behaviours still work — only obstacle-stop &
-        # right-of-way go inert.
         if SurroundingsSensor is None:
             print('[Init] Surroundings sensor module unavailable '
                   '-> obstacle-stop & right-of-way DISABLED (signs still active).')

@@ -441,6 +441,16 @@ class MotionController:
         self._left = 0.0
         self._right = 0.0
 
+    def sync(self, left, right):
+        """Adopt externally-applied wheel speeds as the current state.
+
+        Used when the caller drives the wheels directly during plain lane
+        following (bypassing the slew limiter for crisp steering): keeping the
+        controller's state in sync means a subsequent slew-limited command
+        (halt / arc) still ramps smoothly from the *real* current speed."""
+        self._left = float(left)
+        self._right = float(right)
+
     @property
     def command(self):
         return self._left, self._right

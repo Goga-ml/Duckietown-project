@@ -94,3 +94,44 @@ def draw_status_overlay(image_bgr: np.ndarray, message: str) -> np.ndarray:
     cv2.putText(out, message, (pad + 6, pad + th + 4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 1, cv2.LINE_AA)
     return out
+
+
+def draw_lane_overlay(image_bgr: np.ndarray, lane_dbg: dict, tol: int = 5) -> np.ndarray:
+    """Overlay the lane-follower's per-slice sample points so the operator can
+    confirm the bot is actually tracking the lane markings.
+
+    ``lane_dbg`` is LaneServoingAgent.last_debug_info: it carries the yellow/white
+    lane masks and the y of each horizontal sampling slice. We recompute the mean
+    x per slice from the masks (so each dot lines up with its slice) and draw a
+    yellow dot on the inner line and a white dot on the outer line, plus a centre
+    reference line and a small 'lane detected' status."""
+    if not lane_dbg:
+        return image_bgr
+    out = image_bgr
+    h, w = out.shape[:2]
+
+    ym = lane_dbg.get('yellow_mask')
+    wm = lane_dbg.get('white_mask')
+    slice_ys = lane_dbg.get('slice_ys') or []
+
+    # Centre reference (where the bot aims to keep the lane centre).
+    cv2.line(out, (w // 2, int(h * 0.45)), (w // 2, h), (90, 90, 90), 1, cv2.LINE_AA)
+
+    for y in slice_ys:
+        if not (0 <= y < h):
+            continue
+        y0, y1 = max(0, y - tol), min(h, y + tol)
+        for mask, color in ((ym, (0, 255, 255)), (wm, (255, 255, 255))):
+            if mask is None or mask.shape[:2] != (h, w):
+                continue
+            xs = np.where(mask[y0:y1, :] > 0)[1]
+            if len(xs):
+                mx = int(xs.mean())
+                cv2.circle(out, (mx, y), 6, color, -1)
+                cv2.circle(out, (mx, y), 6, (0, 0, 0), 1)
+
+    detected = bool(lane_dbg.get('lane_detected'))
+    txt = "LANE: tracking" if detected else "LANE: searching"
+    color = (60, 200, 60) if detected else (0, 170, 255)
+    cv2.putText(out, txt, (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+    return out

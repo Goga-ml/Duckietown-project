@@ -82,6 +82,15 @@ _CONTENT = '''
             </div>
 
             <div class="card">
+                <div class="card-header">Speed</div>
+                <div style="display:flex;align-items:center;gap:10px">
+                    <input id="speed-slider" type="range" min="0.05" max="0.5" step="0.01" value="0.2"
+                        style="flex:1" oninput="onSpeedChange(this.value)">
+                    <span id="speed-value" style="font-size:13px;font-variant-numeric:tabular-nums;min-width:32px">0.20</span>
+                </div>
+            </div>
+
+            <div class="card">
                 <div class="card-header">Active Sign</div>
                 <div id="active-sign" class="active-sign">
                     <div class="as-type" id="as-type">none</div>
@@ -154,10 +163,22 @@ _EXTRA_JS = '''
     });
     setInterval(() => { if (_manualMode && Object.values(keyState).some(Boolean)) sendKeys(); }, 150);
 
+    let _speedDirty = false;
+    function onSpeedChange(value) {
+        document.getElementById('speed-value').textContent = parseFloat(value).toFixed(2);
+        _speedDirty = true;
+        postJSON('/set_speed', {value: parseFloat(value)}).then(() => { _speedDirty = false; });
+    }
+
     async function pollStatus() {
         try {
             const data = await fetch('/status').then(r => r.json());
             setRunningUI(data.running);
+
+            if (!_speedDirty && data.base_speed != null) {
+                document.getElementById('speed-slider').value = data.base_speed;
+                document.getElementById('speed-value').textContent = Number(data.base_speed).toFixed(2);
+            }
 
             const status = document.getElementById('model-status');
             if (data.detector_ready) { status.className = 'model-status ok'; status.textContent = 'Detector ready (' + (data.family || 'tag36h11') + ')'; }
