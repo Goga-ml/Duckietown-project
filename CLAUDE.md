@@ -63,6 +63,7 @@ GodotSimulation/ducky-bot/ # Godot 4.6 project (scenes, assets)
 # Simulation (downloads Godot 4.6 on first run, launches scene + server)
 python launch.py --sim --task <task>
 python launch.py --sim --task <task> --debug      # show Godot console
+python launch.py --sim --task <task> --reimport   # force Godot asset re-import
 
 # Hardware: package tasks/<task>/packages + config + models, deploy, start
 python launch.py --run --bot <hostname> --task <task>
@@ -72,6 +73,16 @@ python launch.py --stop --bot <hostname>
 
 Web UI prints its URL on startup (default port 5000). `--sim` reuses a Godot
 scene per `GODOT_SCENES`; not every task has its own scene.
+
+`--reimport` forces Godot to re-import project assets. The default import only
+runs once (first sim launch); pass `--reimport` after **adding new assets** so
+they're picked up — e.g. the **first** `traffic_signs` sim run needs it to import
+the AprilTag texture:
+
+```bash
+python launch.py --sim --task traffic_signs --reimport   # first time only
+python launch.py --sim --task traffic_signs              # subsequently
+```
 
 ## Environment
 
@@ -84,9 +95,24 @@ scene per `GODOT_SCENES`; not every task has its own scene.
 - **visual_lane_servoing** — HSV lane-mask + PD steering (`LaneServoingAgent`).
 - **object_detection** — YOLOv5n ONNX detector (`ObjectDetectionAgent`) + a stop
   state machine (`stop_activity.py`); lane-follows and stops for obstacles.
-- **traffic_signs** — AprilTag sign recognition (`TrafficSignAgent`, `cv2.aruco`).
-  Perception layer (Person A). See `tasks/traffic_signs/INTERFACE.md` for the
-  contract the behaviour/state-machine layer (Person B) builds on.
+- **traffic_signs** — AprilTag sign recognition + behaviour. Perception
+  (`TrafficSignAgent`, AprilTag via `cv2.aruco` or `dt_apriltags`/`pupil_apriltags`
+  on the bot) feeds a behaviour state machine (`state_machine.py`) that, on seeing
+  a sign, keeps lane-following until the red stop line (`stop_line.py`) and only
+  then stops / picks a turn. Obstacle + right-of-way sensing reuses the
+  object_detection model (`sensors.py`). See `tasks/traffic_signs/INTERFACE.md`
+  (perception→behaviour contract) and `BEHAVIOR.md`.
+  - **Sim:** `scenes/traffic_signs.tscn` instances the town map (`map_follower`:
+    real Cross intersection + painted red stop line) and adds an AprilTag board,
+    and the virtual server runs the full behaviour stack, so
+    `--sim --task traffic_signs --reimport` exercises sign→stop-line→turn end to
+    end. The `AprilTagSign` is a plain `MeshInstance3D` placed at a best-guess
+    spot — drag it in the Godot editor so it stands just before the intersection
+    stop line. (A single-loop road has no junction to turn into, hence the town
+    map.)
+  - **On the bot:** the dashboard runs `tasks/traffic_signs/packages/traffic_signs_server.py`
+    (the deploy ships only `tasks/<task>/packages` + `config/`), and the AprilTag
+    backend auto-installs (`dt-apriltags`) on first run if missing.
 - braitenberg, introduction, modcon — earlier teaching tasks.
 
 ## Conventions

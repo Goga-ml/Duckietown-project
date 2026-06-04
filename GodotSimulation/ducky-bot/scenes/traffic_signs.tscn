@@ -1,0 +1,21 @@
+[gd_scene format=3 uid="uid://dtrafficsigns001"]
+
+[ext_resource type="PackedScene" uid="uid://3a5ra5g8ri78" path="res://scenes/map_follower.tscn" id="1_map"]
+[ext_resource type="Texture2D" path="res://scenes/apriltag_36h11_id9.png" id="2_tag"]
+
+[sub_resource type="QuadMesh" id="TagQuad_ts"]
+size = Vector2(0.12, 0.12)
+
+[sub_resource type="StandardMaterial3D" id="TagMat_ts"]
+shading_mode = 0
+cull_mode = 2
+albedo_texture = ExtResource("2_tag")
+
+[node name="traffic_signs" type="Node3D"]
+
+[node name="Town" parent="." instance=ExtResource("1_map")]
+
+[node name="AprilTagSign" type="MeshInstance3D" parent="."]
+transform = Transform3D(-1, 0, 0, 0, 1, 0, 0, 0, -1, 4.154852, 0.13, 4.5)
+mesh = SubResource("TagQuad_ts")
+material_override = SubResource("TagMat_ts")

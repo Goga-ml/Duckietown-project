@@ -18,9 +18,10 @@ GODOT_SCENES = {
     'modcon': 'res://scenes/Modconpath.tscn',
     'navigator': 'res://scenes/map_follower.tscn',
     'object_detection': 'res://scenes/lane_detect.tscn',
-    # Traffic-sign recognition reuses the lane-following map for --sim (the sim
-    # has no AprilTags; signs only appear when running on hardware).
-    'traffic_signs': 'res://scenes/lane_detect.tscn',
+    # Traffic-sign recognition: dedicated scene with an AprilTag sign board and a
+    # red stop line in front of the bot (see scenes/traffic_signs.tscn). Run the
+    # first time with `--reimport` so Godot imports the new tag texture.
+    'traffic_signs': 'res://scenes/traffic_signs.tscn',
 }
 
 DEFAULT_WEB_PORT = 5000

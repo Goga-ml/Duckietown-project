@@ -10,12 +10,26 @@ project_root = os.path.join(script_dir, '..', '..')
 sys.path.insert(0, project_root)
 
 import cv2
+from dataclasses import replace as _dc_replace
 from flask import Flask, Response, render_template_string, jsonify, request
 
 from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
 from tasks.traffic_signs.packages.agent import TrafficSignAgent
 from tasks.traffic_signs.packages import detection_activity as student
-from servers.traffic_signs.visualization import draw_signs, draw_active_banner, draw_lane_overlay
+from tasks.traffic_signs.packages.state_machine import (
+    TrafficSignStateMachine, MotionController, BehaviorConfig,
+    Surroundings, reset_lane_follower, DRIVING, APPROACHING_SIGN,
+)
+from tasks.traffic_signs.packages.stop_line import StopLineDetector
+try:
+    from tasks.traffic_signs.packages.sensors import SurroundingsSensor
+except Exception as _sensor_import_err:
+    SurroundingsSensor = None
+    print(f'[Init] Surroundings sensor unavailable ({_sensor_import_err}); '
+          'obstacle-stop & right-of-way DISABLED, sign behaviours still active.')
+from servers.traffic_signs.visualization import (
+    draw_signs, draw_active_banner, draw_lane_overlay, draw_behavior_state, draw_stop_line,
+)
 from servers.templates.traffic_signs import TRAFFIC_SIGNS_TEMPLATE as HTML_TEMPLATE
 
 from duckiebot.camera_driver.godot_camera_driver import GodotCameraDriver, GodotCameraConfig
@@ -39,9 +53,28 @@ _last_detections = []
 _active_sign     = None
 _detection_lock  = threading.Lock()
 
+# Behaviour layer — same stack the bot runs, so --sim exercises real behaviour.
+sign_sm          = None
+motion           = None
+surround_sensor  = None
+stop_line_det    = StopLineDetector()
+
+_obstacle_queue    = queue.Queue(maxsize=1)
+_surroundings      = Surroundings.clear()
+_surroundings_lock = threading.Lock()
+_stop_line_ahead   = False
+
+_last_tick_t  = None
+_prev_state   = DRIVING
+_control_lock = threading.Lock()
+
 keys_pressed     = {'up': False, 'down': False, 'left': False, 'right': False}
 _keys_lock       = threading.Lock()
 _keys_last_update = time.time()
+
+
+def _clamp01(x):
+    return 0.0 if x < 0.0 else 1.0 if x > 1.0 else float(x)
 
 
 def detection_loop():
@@ -60,6 +93,21 @@ def detection_loop():
             with _detection_lock:
                 _last_detections = result
                 _active_sign     = active
+
+
+def obstacle_loop():
+    global _surroundings
+    while not stop_event.is_set():
+        if surround_sensor is None or not surround_sensor.model_loaded:
+            time.sleep(0.1)
+            continue
+        try:
+            frame_rgb = _obstacle_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        surr = surround_sensor.update(frame_rgb)
+        with _surroundings_lock:
+            _surroundings = surr
 
 
 def manual_control_loop():
@@ -83,12 +131,16 @@ def manual_control_loop():
         elif kc['left']:               left, right = -0.3, 0.3
         elif kc['right']:              left, right = 0.3, -0.3
 
-        if not wheels.is_game_over():
-            wheels.set_wheels_speed(left, right)
+        with _control_lock:
+            if manual_mode and not wheels.is_game_over():
+                wheels.set_wheels_speed(left, right)
         time.sleep(0.05)
 
 
 def visualize(frame_rgb):
+    """frame_rgb is RGB from the Godot camera."""
+    global _last_tick_t, _prev_state, _stop_line_ahead
+
     bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
     if wheels is None:
         return bgr
@@ -98,29 +150,77 @@ def visualize(frame_rgb):
             _frame_queue.put_nowait(frame_rgb)
         except queue.Full:
             pass
+    if surround_sensor is not None and surround_sensor.model_loaded:
+        try:
+            _obstacle_queue.put_nowait(frame_rgb)
+        except queue.Full:
+            pass
+
+    _stop_line_ahead = stop_line_det.detect(frame_rgb)
 
     with _detection_lock:
         detections = list(_last_detections)
         active     = _active_sign
+    with _surroundings_lock:
+        surr = _surroundings
+    surr = _dc_replace(surr, stop_line_ahead=_stop_line_ahead)
 
     lane_dbg = None
     if manual_mode:
         pass
-    elif lane_agent is not None:
-        pwm_left, pwm_right = lane_agent.compute_commands(frame_rgb)
-        lane_dbg = lane_agent.last_debug_info
-        target = 0.0 if (not running or wheels.is_game_over()) else 1.0
-        wheels.set_wheels_speed(pwm_left * target, pwm_right * target)
+    elif lane_agent is not None and sign_sm is not None and motion is not None:
+        with _control_lock:
+            now = time.monotonic()
+            dt  = (now - _last_tick_t) if _last_tick_t is not None else 0.05
+            _last_tick_t = now
+            dt = max(0.01, min(0.2, dt))
+
+            lane_cmd = lane_agent.compute_commands(frame_rgb)
+            lane_dbg = lane_agent.last_debug_info
+
+            if not running or wheels.is_game_over():
+                wheels.set_wheels_speed(0.0, 0.0)
+                motion.sync(0.0, 0.0)
+            else:
+                cmd = sign_sm.update(active, surr, dt)
+                if sign_sm.state == DRIVING and _prev_state not in (DRIVING, APPROACHING_SIGN):
+                    reset_lane_follower(lane_agent)
+                _prev_state = sign_sm.state
+                if cmd.kind == 'lane_follow':
+                    left  = _clamp01(lane_cmd[0] * cmd.speed_scale)
+                    right = _clamp01(lane_cmd[1] * cmd.speed_scale)
+                    motion.sync(left, right)
+                else:
+                    left, right = motion.step(cmd, lane_cmd, dt)
+                wheels.set_wheels_speed(left, right)
 
     if lane_dbg is not None:
         draw_lane_overlay(bgr, lane_dbg)
+    draw_stop_line(bgr, stop_line_det)
     if detections:
         draw_signs(bgr, detections)
     draw_active_banner(bgr, active)
+    if sign_sm is not None:
+        draw_behavior_state(bgr, sign_sm.state, sign_sm.note)
     return bgr
 
 
 generate_frames = make_frame_generator(lambda: camera, visualize, quality=50)
+
+
+def _reset_behavior():
+    global _prev_state, _last_tick_t, _surroundings
+    if sign_sm is not None:
+        sign_sm.reset()
+    if motion is not None:
+        motion.reset()
+    if surround_sensor is not None:
+        surround_sensor.reset()
+    reset_lane_follower(lane_agent)
+    with _surroundings_lock:
+        _surroundings = Surroundings.clear()
+    _prev_state  = DRIVING
+    _last_tick_t = None
 
 
 @app.route('/')
@@ -134,23 +234,29 @@ def video():
 @app.route('/start', methods=['POST'])
 def start():
     global running
-    running = True
+    with _control_lock:
+        _reset_behavior()
+        running = True
     return jsonify({'status': 'running'})
 
 @app.route('/stop', methods=['POST'])
 def stop():
     global running
-    running = False
-    if wheels:
-        wheels.set_wheels_speed(0.0, 0.0)
+    with _control_lock:
+        running = False
+        if wheels:
+            wheels.set_wheels_speed(0.0, 0.0)
+        _reset_behavior()
     return jsonify({'status': 'stopped'})
 
 @app.route('/reset', methods=['POST'])
 def reset():
     global _last_detections, _active_sign, running
-    if wheels:
-        wheels.reset_game()
-    running = True
+    with _control_lock:
+        if wheels:
+            wheels.reset_game()
+        _reset_behavior()
+        running = True
     with _detection_lock:
         _last_detections = []
         _active_sign     = None
@@ -160,9 +266,11 @@ def reset():
 def set_mode():
     global manual_mode
     mode = request.json.get('mode', 'auto') if request.json else 'auto'
-    manual_mode = (mode == 'manual')
-    if wheels and not manual_mode:
-        wheels.set_wheels_speed(0.0, 0.0)
+    with _control_lock:
+        manual_mode = (mode == 'manual')
+        if wheels and not manual_mode:
+            wheels.set_wheels_speed(0.0, 0.0)
+            _reset_behavior()
     return jsonify({'mode': 'manual' if manual_mode else 'auto'})
 
 @app.route('/set_speed', methods=['POST'])
@@ -189,6 +297,8 @@ def status():
     with _detection_lock:
         dets = list(_last_detections)
         active = _active_sign
+    with _surroundings_lock:
+        surr = _surroundings
     return jsonify({
         'running':        running,
         'manual_mode':    manual_mode,
@@ -198,6 +308,13 @@ def status():
         'family':         sign_agent.family if sign_agent else None,
         'base_speed':     getattr(lane_agent, 'base_speed', None) if lane_agent else None,
         'active_sign':    active,
+        'behavior_state': sign_sm.state if sign_sm else None,
+        'behavior_note':  sign_sm.note if sign_sm else None,
+        'chosen_turn':    sign_sm.chosen_turn if sign_sm else None,
+        'obstacle_ahead': surr.obstacle_ahead,
+        'robot_on_right': surr.robot_on_right,
+        'stop_line':      _stop_line_ahead,
+        'sensor_ready':   surround_sensor is not None and surround_sensor.model_loaded,
         'detections': [
             {'tag_id': d.tag_id, 'sign_type': d.sign_type, 'distance_m': d.distance_m,
              'turns': d.turns, 'offset_norm': d.offset_norm}
@@ -207,7 +324,7 @@ def status():
 
 
 def main():
-    global lane_agent, sign_agent, camera, wheels
+    global lane_agent, sign_agent, camera, wheels, sign_sm, motion, surround_sensor
 
     import argparse
     ap = argparse.ArgumentParser()
@@ -219,30 +336,40 @@ def main():
 
     suppress_http_logs()
     print('=' * 60)
-    print('TRAFFIC SIGNS — LANE FOLLOW + APRILTAG SIGN RECOGNITION')
+    print('TRAFFIC SIGNS (SIM) — LANE FOLLOW + SIGN BEHAVIOUR STATE MACHINE')
     print('=' * 60)
-    print('NOTE: the Godot simulator has no AprilTags, so detections will be')
-    print('      empty in sim. Use --webcam/--image in test_detector.py or')
-    print('      run on hardware (real_server) to see signs.')
 
-    print('\n[1/4] Creating lane agent...')
+    beh_cfg = BehaviorConfig.from_yaml()
+    sign_sm = TrafficSignStateMachine(beh_cfg)
+    motion  = MotionController(beh_cfg)
+
+    print('\n[1/4] Creating lane + sign agents...')
     lane_agent = LaneServoingAgent()
-    print(f'  speed={lane_agent.base_speed}')
-
-    print('\n[2/4] Creating sign agent...')
+    print(f'  lane speed={lane_agent.base_speed}')
     sign_agent = TrafficSignAgent()
+    print(f'  sign backend={sign_agent.backend_name or sign_agent.load_error}')
 
-    print('\n[3/4] Initializing wheels...')
+    if SurroundingsSensor is not None:
+        try:
+            surround_sensor = SurroundingsSensor()
+            print('  obstacle/right-of-way sensor:',
+                  'ready' if surround_sensor.model_loaded else 'model unavailable (disabled)')
+        except Exception as e:
+            print(f'  obstacle sensor init failed: {e}')
+
+    print('\n[2/4] Initializing wheels...')
     wheels = GodotWheelsDriver(
         WheelPWMConfiguration(pwm_min=0), WheelPWMConfiguration(pwm_min=0),
         godot_host=args.godot_host, godot_port=args.wheel_port,
     )
 
-    print('\n[4/4] Initializing camera...')
+    print('\n[3/4] Initializing camera...')
     camera = GodotCameraDriver(godot_config=GodotCameraConfig(host='0.0.0.0', port=args.frame_port))
     camera.start()
 
+    print('\n[4/4] Starting threads...')
     threading.Thread(target=detection_loop,      daemon=True).start()
+    threading.Thread(target=obstacle_loop,       daemon=True).start()
     threading.Thread(target=manual_control_loop, daemon=True).start()
 
     web_port = find_available_port(args.port)

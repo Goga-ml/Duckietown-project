@@ -158,7 +158,7 @@ def find_godot():
     return download_godot()
 
 
-def launch_godot(godot_path=None, debug=False, camera_port=None, wheel_port_hint=None, port_file_path=None, scene=None):
+def launch_godot(godot_path=None, debug=False, camera_port=None, wheel_port_hint=None, port_file_path=None, scene=None, force_import=False):
     global godot_process
 
     if not godot_path:
@@ -175,12 +175,13 @@ def launch_godot(godot_path=None, debug=False, camera_port=None, wheel_port_hint
         print(f"❌ ERROR: Godot project not found at {GODOT_PROJECT}")
         return False
 
-    # Import assets on first run
+    # Import assets on first run, or whenever --reimport is passed (needed after
+    # adding new assets like the traffic_signs AprilTag texture).
     imported_dir = os.path.join(GODOT_PROJECT, '.godot', 'imported')
-    needs_import = not (os.path.isdir(imported_dir) and
+    needs_import = force_import or not (os.path.isdir(imported_dir) and
                         any(f.endswith(('.scn', '.res', '.mesh')) for f in os.listdir(imported_dir)))
     if needs_import:
-        print("⏳ Importing Godot project assets (first run only)...")
+        print("⏳ Importing Godot project assets...")
         try:
             subprocess.run([godot_path, '--path', GODOT_PROJECT, '--import', '--headless'],
                            cwd=GODOT_PROJECT, timeout=120)
@@ -275,7 +276,8 @@ def run_in_simulation(args):
                         camera_port=camera_port,
                         wheel_port_hint=wheel_port_hint,
                         port_file_path=port_file_path,
-                        scene=godot_scene):
+                        scene=godot_scene,
+                        force_import=getattr(args, 'reimport', False)):
         return 1
 
     godot_init_timeout = 60 if platform.system() == 'Darwin' else 15
@@ -494,6 +496,8 @@ Examples:
     parser.add_argument("--port", type=int, default=5000, help="Task web server port")
     parser.add_argument("--godot-path", type=str, default=None)
     parser.add_argument("--debug", action="store_true", help="Show Godot console output")
+    parser.add_argument("--reimport", action="store_true",
+                        help="Force Godot to re-import assets (use after adding new textures/scenes)")
 
     args = parser.parse_args()
 
