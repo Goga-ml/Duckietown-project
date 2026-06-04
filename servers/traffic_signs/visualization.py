@@ -28,7 +28,10 @@ def draw_signs(image_bgr: np.ndarray, detections: list) -> np.ndarray:
         cv2.polylines(out, [pts], isClosed=True, color=color, thickness=2)
 
         name = det.sign_type or f"id {det.tag_id}"
-        label = f"{name}  {det.distance_m:.2f}m"
+        # Show the apparent size in px alongside the metric distance: the
+        # behaviour layer can trigger on px (immune to intrinsics error), so
+        # this is the number to read when tuning approach_pixel_size / at_sign.
+        label = f"{name}  {det.distance_m:.2f}m  {det.pixel_size:.0f}px"
         x1, y1, _x2, _y2 = det.bbox
 
         (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
@@ -47,7 +50,9 @@ def draw_active_banner(image_bgr: np.ndarray, active: dict) -> np.ndarray:
     turns = active.get("turns")
     turns_txt = f"  turns={','.join(turns)}" if turns else ""
     at = "  [AT SIGN]" if active.get("at_sign") else ""
-    text = f"ACTIVE: {active['sign_type']}  {active['distance_m']}m{turns_txt}{at}"
+    px = active.get("pixel_size")
+    px_txt = f"  {px:.0f}px" if px is not None else ""
+    text = f"ACTIVE: {active['sign_type']}  {active['distance_m']}m{px_txt}{turns_txt}{at}"
 
     (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
     cv2.rectangle(out, (8, 8), (8 + tw + 12, 8 + th + baseline + 10),
@@ -66,6 +71,7 @@ _STATE_COLORS = {
     "WAITING_FOR_RIGHT_OF_WAY": (0, 140, 255),    # orange: giving way
     "TURNING":                  (220, 170, 50),   # blue: executing a turn
     "OBSTACLE_STOP":            (60, 60, 220),    # red: blocked
+    "YIELDING":                 (0, 200, 255),    # amber: easing off for a yield
 }
 
 

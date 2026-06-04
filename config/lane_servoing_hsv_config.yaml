@@ -4,9 +4,15 @@ white_lower_v: 180
 white_upper_h: 179
 white_upper_s: 60
 white_upper_v: 255
-yellow_lower_h: 80
-yellow_lower_s: 94
-yellow_lower_v: 96
-yellow_upper_h: 120
+# Yellow centre line. glados's camera has a strong pink/magenta white-balance
+# cast, which shifts the yellow line down to hue ~15-20 (measured on a live
+# frame). The previous band (hue 80-120) is cyan/blue and detected 0 px, so the
+# follower tracked the white edge alone and wandered. s_min keeps the low-
+# saturation road (S~38) out; widen the hue band if a yellow line is still
+# missed under different lighting. RE-VERIFY on the live feed.
+yellow_lower_h: 12
+yellow_lower_s: 60
+yellow_lower_v: 80
+yellow_upper_h: 40
 yellow_upper_s: 255
 yellow_upper_v: 255

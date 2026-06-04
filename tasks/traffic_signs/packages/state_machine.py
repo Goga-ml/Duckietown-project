@@ -46,6 +46,7 @@ STOPPED                  = "STOPPED"
 WAITING_FOR_RIGHT_OF_WAY = "WAITING_FOR_RIGHT_OF_WAY"
 TURNING                  = "TURNING"
 OBSTACLE_STOP            = "OBSTACLE_STOP"
+YIELDING                 = "YIELDING"
 
 _CONFIG_FILE = os.path.normpath(os.path.join(
     os.path.dirname(__file__), '..', '..', '..', 'config', 'traffic_signs_config.yaml'
@@ -102,13 +103,33 @@ class BehaviorConfig:
     # --- Sign approach / stop timing -------------------------------------
     approach_distance_m: float = 0.60   # start reacting to a sign at this range
     at_sign_distance_m:  float = 0.30   # "arrived" range (matches perception)
+    # Apparent-size fallback for "how close is the sign?". distance_m comes from
+    # solvePnP and is only as good as the camera intrinsics / tag-size config; if
+    # those don't match the real (or sim) camera it can read systematically wrong
+    # and the bot then "sees but ignores" the sign. pixel_size (the tag's edge
+    # length in pixels) is measured straight from the image, so it triggers the
+    # reaction even when distance_m is mis-scaled. A sign is treated as close
+    # enough to react to when EITHER distance_m <= approach_distance_m OR
+    # pixel_size >= approach_pixel_size (same idea for the "at the sign" check).
+    # 0 disables a size gate. Tune to the px the overlay shows at those ranges.
+    approach_pixel_size: float = 34.0   # ~ a 6.5cm tag at 0.60 m with fx≈340
+    at_sign_pixel_size:  float = 68.0   # ~ a 6.5cm tag at 0.30 m with fx≈340
     stop_pause_s:        float = 2.0    # dwell time at a stop sign
-    yield_creep_scale:   float = 0.40   # speed while creeping toward a yield line
+    # Yield = ease off a little near the sign, then resume cruise once past it
+    # (never a stop). 1.0 = no slowdown, lower = slower; 0.7 is a gentle ~30% cut.
+    yield_slow_scale:    float = 0.7    # lane-follow speed while a yield sign is in range
+    yield_creep_scale:   float = 0.40   # (legacy; only the old stop-style yield used this)
     cruise_scale:        float = 1.0    # lane-follow speed scale when DRIVING
     approach_line_scale: float = 0.8    # lane-follow speed while rolling to the stop line
+    # When the lane follower loses the lane ("searching" / recovery) it commands
+    # zero and the bot stalls. Used by the SERVER glue (not the state machine): in
+    # that case drive straight forward at this normalized wheel speed instead, so
+    # the bot pushes through gaps / blank intersections until it re-finds the
+    # lane. 0 keeps the old stop-when-lost behaviour.
+    lane_lost_creep:     float = 0.18
     line_search_max_s:   float = 6.0    # if no stop line is found by now, act anyway
     cooldown_s:          float = 3.0    # min hold on the handled-sign latch
-    lost_grace_s:        float = 0.5    # (unused; kept for config compat)
+    lost_grace_s:        float = 0.5    # stop/yield tag gone this long while close -> arrived
     right_of_way_max_wait_s: float = 5.0  # give way then proceed (no deadlock)
 
     # --- Open-loop turns (NORMALIZED wheel speeds + durations) -----------
@@ -124,6 +145,15 @@ class BehaviorConfig:
     turn_straight_left:  float = 0.28
     turn_straight_right: float = 0.28
     turn_straight_s:     float = 1.2
+    # Before arcing left/right, drive straight forward this long to pull INTO the
+    # intersection (the sign/stop line sits before the junction). 0 = turn at the
+    # line. Increase so the bot turns from inside the intersection.
+    intersection_entry_s:     float = 0.8
+    intersection_entry_speed: float = 0.30  # forward wheel speed during entry
+    # '' = pick a random allowed turn (project spec). Set 'left'/'right'/'straight'
+    # to force it (when the sign allows it) — useful to verify the turn arc isn't
+    # physically inverted, or for a junction that only goes one way.
+    force_turn: str = ""
 
     # --- Motion smoothing -------------------------------------------------
     max_accel:  float = 2.0   # max change in wheel command per second (slew)
@@ -184,6 +214,9 @@ class TrafficSignStateMachine:
         # view — but a *different* sign is never suppressed.
         self._target_tag = None      # tag_id of the sign currently being handled
         self._handled_tag = None     # tag_id latched after we finish a sign
+        # After handling a sign, ignore all signs until we've driven clear of its
+        # red stop line — one action per intersection (no re-stop / re-turn loop).
+        self._await_line_clear = False
 
     # -- public helpers ---------------------------------------------------
     @property
@@ -202,6 +235,7 @@ class TrafficSignStateMachine:
         self._lost_time = 0.0
         self._target_tag = None
         self._handled_tag = None     # fresh start reacts to whatever is in view
+        self._await_line_clear = False
 
     # -- main tick --------------------------------------------------------
     def update(self, active, surroundings, dt: float) -> DriveCommand:
@@ -216,6 +250,7 @@ class TrafficSignStateMachine:
             WAITING_FOR_RIGHT_OF_WAY: self._h_waiting,
             TURNING:                  self._h_turning,
             OBSTACLE_STOP:            self._h_obstacle,
+            YIELDING:                 self._h_yielding,
         }[self.state]
 
         cmd = handler(active, surroundings, dt)
@@ -231,18 +266,35 @@ class TrafficSignStateMachine:
             return self._goto(OBSTACLE_STOP, f"obstacle: {surr.obstacle_reason}",
                               self._cmd_halt())
 
+        # After handling a sign, drive clear of its red stop line before reacting
+        # again. Otherwise the still-visible line + lingering sign re-trigger us
+        # and we stop/turn over and over at the same junction (the "stops as long
+        # as the red line is visible" / "turned twice" bug). Re-arm once clear.
+        if self._await_line_clear:
+            if surr.stop_line_ahead:
+                self.note = "leaving intersection"
+                return self._cmd_lane(self.cfg.cruise_scale)
+            self._await_line_clear = False
+
         self._update_sign_latch(active)
         if active is not None and not self._suppressed(active) \
-                and active['distance_m'] <= self.cfg.approach_distance_m:
+                and self._is_close(active):
             kind = self._classify(active)
             if kind is not None:
-                # Latch the action now (the sign passes out of view as we close
-                # in), but DON'T act yet: keep lane-following until we reach the
-                # red stop line that marks the end of the road.
                 self._sign_kind = kind
                 self._target_tag = active['tag_id']
-                self._chosen_turn = (self._rng.choice(active['turns'])
-                                     if kind == 'intersection' else None)
+                self._lost_time = 0.0   # start the lost-sign / passed-sign clock fresh
+                if kind == 'yield':
+                    # A yield is NOT a stop: just ease off the throttle while the
+                    # sign is in range, then resume cruise once we've driven past
+                    # it. No stop line, no right-of-way halt (see _h_yielding).
+                    self._chosen_turn = None
+                    return self._goto(YIELDING, "yield: slowing",
+                                      self._cmd_lane(self.cfg.yield_slow_scale))
+                # Stop / intersection: latch the action now (the sign passes out of
+                # view as we close in), but DON'T act yet — keep lane-following
+                # until we reach the red stop line that marks the end of the road.
+                self._chosen_turn = self._pick_turn(active['turns']) if kind == 'intersection' else None
                 turn_txt = f" -> turn {self._chosen_turn}" if self._chosen_turn else ""
                 return self._goto(APPROACHING_SIGN, f"{kind}{turn_txt}: to stop line",
                                   self._cmd_lane(self._approach_speed()))
@@ -260,13 +312,51 @@ class TrafficSignStateMachine:
             return self._goto(OBSTACLE_STOP, f"obstacle: {surr.obstacle_reason}",
                               self._cmd_halt())
 
+        # Track whether the sign we latched is still in view. A high-mounted tag
+        # slips above the camera as we close in, so it goes missing right when we
+        # arrive; count how long it's been gone (reset whenever we still see it).
+        if active is not None and active.get('tag_id') == self._target_tag:
+            self._lost_time = 0.0
+        else:
+            self._lost_time += dt
+
+        # The junction is marked by the red stop line — that is where we act. We
+        # also accept "we're basically on top of the sign" (at_sign / large
+        # apparent size) so a stop still happens if the line is faint/unpainted
+        # and the tag is right in front of us.
         if surr.stop_line_ahead:
             self.note = "stop line reached"
             return self._on_arrival()
+        # Stop / yield may act right at the sign if the line is faint/unpainted.
+        # An INTERSECTION must NOT: its turn has to happen at the junction (the
+        # stop line), never at the sign (which sits before it) — otherwise it
+        # turns too early. So intersections wait for the line (or the failsafe).
+        if self._sign_kind != 'intersection' and self._at_sign(active):
+            self.note = "at sign (no line); acting"
+            return self._on_arrival()
+        # Lost-sign grace: a stop/yield tag we were closing on has now been out of
+        # view for lost_grace_s — we're on top of it (it slipped above the
+        # camera). Stop right here rather than coasting to the line-search
+        # failsafe and overshooting the sign. Intersections are excluded: their
+        # turn must wait for the real junction (stop line / failsafe), never the
+        # spot where the sign happened to disappear.
+        if self._sign_kind != 'intersection' and self._lost_time >= self.cfg.lost_grace_s:
+            self.note = "sign reached (left view); acting"
+            return self._on_arrival()
 
-        # Safety net: if the line is never detected (faded paint, none painted),
-        # act anyway after a bounded search instead of driving on forever.
+        # Safety net after a bounded search with NO junction cue at all:
+        #   * stop / yield -> act anyway (a brief stop mid-lane is harmless and
+        #     respects the sign), then carry on.
+        #   * intersection -> do NOT arc blindly into the middle of the road
+        #     (that was the "turns too early / turns into nothing" bug). Abandon
+        #     the turn and just keep lane-following straight through. A turn only
+        #     ever fires at a real, detected junction.
         if self._state_time >= self.cfg.line_search_max_s:
+            if self._sign_kind == 'intersection':
+                self._chosen_turn = None
+                self._mark_handled()
+                return self._goto(DRIVING, "no junction found; staying in lane",
+                                  self._cmd_lane(self.cfg.cruise_scale))
             self.note = "no stop line found; acting"
             return self._on_arrival()
 
@@ -302,6 +392,14 @@ class TrafficSignStateMachine:
             self._turn_elapsed = 0.0
             return self._goto(TURNING, f"turning {self._chosen_turn}",
                               self._cmd_turn())
+        if self._sign_kind == 'stop':
+            # Drive straight THROUGH the junction open-loop before handing back to
+            # the lane follower. Lane markings are ambiguous inside an
+            # intersection, so resuming lane following right on the stop line
+            # stalls in recovery ("lane searching") and the bot never moves.
+            self._chosen_turn = 'straight'
+            self._turn_elapsed = 0.0
+            return self._goto(TURNING, "crossing intersection", self._cmd_turn())
         self._mark_handled()
         return self._goto(DRIVING, "proceeding", self._cmd_lane(self.cfg.cruise_scale))
 
@@ -310,19 +408,28 @@ class TrafficSignStateMachine:
     # obstacle appears mid-turn we pause (halt) without consuming turn time, so
     # the manoeuvre resumes cleanly once the way is clear.
     def _h_turning(self, active, surr, dt) -> DriveCommand:
-        left, right, duration = self._turn_params()
-
         if surr.obstacle_ahead:
             self.note = f"turn {self._chosen_turn} paused: obstacle"
             return self._cmd_halt()
 
         self._turn_elapsed += dt
-        if self._turn_elapsed >= duration:
+        left, right, duration = self._turn_params()
+        # Pull forward into the junction before arcing (only for L/R turns; a
+        # straight "turn" just drives through). This is why turns happen IN the
+        # intersection, not at the sign/stop line.
+        entry = self.cfg.intersection_entry_s if self._chosen_turn in ('left', 'right') else 0.0
+
+        if self._turn_elapsed < entry:
+            self.note = f"entering intersection ({self._turn_elapsed:.1f}/{entry:.1f}s)"
+            v = self.cfg.intersection_entry_speed
+            return self._cmd_arc(v, v)
+
+        if self._turn_elapsed >= entry + duration:
             self._chosen_turn = None
             self._mark_handled()
             return self._goto(DRIVING, "turn complete", self._cmd_lane(self.cfg.cruise_scale))
 
-        self.note = f"turning {self._chosen_turn} ({self._turn_elapsed:.1f}/{duration:.1f}s)"
+        self.note = f"turning {self._chosen_turn} ({self._turn_elapsed - entry:.1f}/{duration:.1f}s)"
         return self._cmd_arc(left, right)
 
     # OBSTACLE_STOP: stay halted until the obstacle clears (the sensor applies
@@ -332,6 +439,34 @@ class TrafficSignStateMachine:
             return self._goto(DRIVING, "obstacle cleared", self._cmd_lane(self.cfg.cruise_scale))
         self.note = f"obstacle: {surr.obstacle_reason or 'blocked'}"
         return self._cmd_halt()
+
+    # YIELDING: a yield sign just means "ease off / give way a little" — never a
+    # full stop. We keep lane-following at a reduced speed while the yield sign is
+    # in range, then return to normal cruise speed once we've driven past it (the
+    # tag drops out of view / recedes). An obstacle dead ahead still overrides to
+    # a hard stop, like everywhere else.
+    def _h_yielding(self, active, surr, dt) -> DriveCommand:
+        if surr.obstacle_ahead:
+            return self._goto(OBSTACLE_STOP, f"obstacle: {surr.obstacle_reason}",
+                              self._cmd_halt())
+
+        # Still in the yield zone: our target tag is visible and close -> hold the
+        # reduced speed and keep the "passed it" timer reset.
+        if active is not None and active.get('tag_id') == self._target_tag \
+                and self._is_close(active):
+            self._lost_time = 0.0
+            self.note = "yield: slowing"
+            return self._cmd_lane(self.cfg.yield_slow_scale)
+
+        # The sign has dropped out of range/view — we're passing / past it. After
+        # a short grace (rides out 1-frame dropouts) resume normal cruise speed.
+        self._lost_time += dt
+        if self._lost_time >= self.cfg.lost_grace_s:
+            self._mark_handled(await_line=False)   # no junction/line for a yield
+            return self._goto(DRIVING, "yield passed; resuming speed",
+                              self._cmd_lane(self.cfg.cruise_scale))
+        self.note = "yield: passing"
+        return self._cmd_lane(self.cfg.yield_slow_scale)
 
     # -- arrival branching ------------------------------------------------
     def _on_arrival(self) -> DriveCommand:
@@ -343,6 +478,38 @@ class TrafficSignStateMachine:
         return self._goto(WAITING_FOR_RIGHT_OF_WAY, "yield: checking", self._cmd_halt())
 
     # -- small helpers ----------------------------------------------------
+    def _pick_turn(self, turns):
+        """Choose a turn from the sign's allowed set. Random per the project spec,
+        unless `force_turn` is configured AND allowed by the sign (handy for
+        testing / calibrating the turn arc, or matching a one-way junction)."""
+        forced = (self.cfg.force_turn or "").strip().lower()
+        if forced in turns:
+            return forced
+        return self._rng.choice(turns)
+
+    def _is_close(self, active) -> bool:
+        """True once the sign is near enough to start reacting (decelerate +
+        latch the action). Robust to a mis-scaled distance estimate: fires on
+        EITHER the metric distance OR the apparent tag size in pixels (which is
+        measured directly from the image — see BehaviorConfig.approach_pixel_size)."""
+        if active is None:
+            return False
+        if active['distance_m'] <= self.cfg.approach_distance_m:
+            return True
+        px = active.get('pixel_size', 0.0)
+        return self.cfg.approach_pixel_size > 0 and px >= self.cfg.approach_pixel_size
+
+    def _at_sign(self, active) -> bool:
+        """True once we've essentially reached the sign. Same dual gate as
+        _is_close but at the closer 'arrived' thresholds. Used as a fallback for
+        acting when the red stop line is faint or unpainted."""
+        if active is None:
+            return False
+        if active.get('at_sign'):
+            return True
+        px = active.get('pixel_size', 0.0)
+        return self.cfg.at_sign_pixel_size > 0 and px >= self.cfg.at_sign_pixel_size
+
     def _classify(self, active):
         """Map a perception active-sign dict to the behaviour we owe it, or
         None if it's an informational sign we don't act on."""
@@ -368,13 +535,19 @@ class TrafficSignStateMachine:
             'straight': (c.turn_straight_left, c.turn_straight_right, c.turn_straight_s),
         }[self._chosen_turn]
 
-    def _mark_handled(self):
+    def _mark_handled(self, await_line=True):
         """Latch the sign we just finished so we don't immediately re-trigger on
         it while it lingers in view as we pull away. ``cooldown_s`` is a *minimum*
         hold (rides out 1-frame perception dropouts); the latch then clears once
-        the sign actually leaves the reaction zone (see _update_sign_latch)."""
+        the sign actually leaves the reaction zone (see _update_sign_latch).
+
+        ``await_line``: stop/intersection signs sit at a red stop line, so we also
+        suppress ALL signs until that line is behind us (one action per junction).
+        A yield has no line — pass ``await_line=False`` so it doesn't wrongly
+        block the next sign while waiting for a line that will never come."""
         self._handled_tag = self._target_tag
         self._cooldown_until = self._now + self.cfg.cooldown_s
+        self._await_line_clear = await_line
 
     def _suppressed(self, active) -> bool:
         """True while ``active`` is the SAME sign we just handled. A different

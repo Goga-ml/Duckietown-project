@@ -21,7 +21,7 @@ from tasks.traffic_signs.packages.state_machine import (
     TrafficSignStateMachine, MotionController, BehaviorConfig, Surroundings,
     reset_lane_follower,
     DRIVING, APPROACHING_SIGN, STOPPED, WAITING_FOR_RIGHT_OF_WAY,
-    TURNING, OBSTACLE_STOP,
+    TURNING, OBSTACLE_STOP, YIELDING,
 )
 import random
 
@@ -38,14 +38,20 @@ def check(cond, msg):
         _failures.append(msg)
 
 
-def mk_active(sign_type, distance_m, turns=None, at_sign_distance=0.30, tag_id=0):
-    """Build a perception active-sign dict matching INTERFACE.md."""
+def mk_active(sign_type, distance_m, turns=None, at_sign_distance=0.30, tag_id=0,
+              pixel_size=0.0):
+    """Build a perception active-sign dict matching INTERFACE.md.
+
+    ``pixel_size`` defaults to 0.0 so the behaviour's apparent-size gates stay
+    inert and tests that only vary ``distance_m`` exercise the metric path
+    exactly as before; set it to drive the size-based triggers."""
     return {
         "tag_id": tag_id,
         "sign_type": sign_type,
         "turns": turns,
         "distance_m": round(distance_m, 3),
         "offset_norm": 0.0,
+        "pixel_size": round(pixel_size, 1),
         "at_sign": distance_m <= at_sign_distance,
     }
 
@@ -158,7 +164,7 @@ def test_stage2_stop_sign():
           "speed decreased smoothly during approach (no acceleration into the sign)")
 
     # After the pause, with the way clear, it resumes driving.
-    s.run(int(s.cfg.stop_pause_s / s.dt) + 6, active=None, surr=CLEAR)
+    s.run(int((s.cfg.stop_pause_s + s.cfg.turn_straight_s) / s.dt) + 10, active=None, surr=CLEAR)
     check(s.reached(WAITING_FOR_RIGHT_OF_WAY), "checked right-of-way after the pause")
     check(s.sm.state == DRIVING, "resumed DRIVING after the stop")
     check(s.smooth_ok, f"motion stayed smooth (worst jump {s.worst_jump:.3f} <= {s.max_step:.3f})")
@@ -168,7 +174,7 @@ def test_stage2_cooldown():
     print("\nStage 2b: does not re-trigger on the sign it just passed")
     s = Sim()
     s.approach('stop', surr=CLEAR)
-    s.run(int(s.cfg.stop_pause_s / s.dt) + 6, active=None, surr=CLEAR)
+    s.run(int((s.cfg.stop_pause_s + s.cfg.turn_straight_s) / s.dt) + 10, active=None, surr=CLEAR)
     check(s.sm.state == DRIVING, "back to DRIVING")
     # The same stop sign is still in view as we pull away; cooldown must ignore it.
     s.run(10, active=mk_active('stop', 0.45), surr=CLEAR)
@@ -179,7 +185,7 @@ def test_stage2_no_restop_while_sign_lingers():
     print("\nStage 2c: no SECOND stop while the same sign lingers in-zone past cooldown")
     s = Sim()
     s.approach('stop', surr=CLEAR)
-    s.run(int(s.cfg.stop_pause_s / s.dt) + 6, active=None, surr=CLEAR)
+    s.run(int((s.cfg.stop_pause_s + s.cfg.turn_straight_s) / s.dt) + 10, active=None, surr=CLEAR)
     check(s.sm.state == DRIVING, "resumed driving after the stop")
     # Same sign (tag 0) stays within the reaction zone far longer than cooldown_s
     # as the bot crawls away. The tag-id latch must keep suppressing it.
@@ -187,11 +193,100 @@ def test_stage2_no_restop_while_sign_lingers():
     check(s.sm.state == DRIVING, "did not re-stop at the same lingering sign (no re-trigger loop)")
 
 
+def test_stage2_stop_only_while_line_lingers():
+    print("\nStage 2e: stops ONCE (~stop_pause_s), not for as long as the red line shows")
+    s = Sim()
+    s.approach('stop', surr=CLEAR)                 # first (and only) stop at the line
+    # The red stop line + stop sign stay in view far longer than the pause as the
+    # bot sits on/rolls over the line. It must NOT keep re-stopping.
+    held = Surroundings(stop_line_ahead=True)
+    s.run(int(s.cfg.stop_pause_s / s.dt) + 80, active=mk_active('stop', 0.25, tag_id=0), surr=held)
+    entries, prev = 0, None
+    for r in s.trace:
+        if r['state'] == STOPPED and prev != STOPPED:
+            entries += 1
+        prev = r['state']
+    check(entries == 1, f"entered STOPPED exactly once (saw {entries})")
+    check(s.sm.state != STOPPED, "not stuck stopped while the red line lingers")
+
+
+def test_stage2_size_gate_triggers_when_distance_far():
+    print("\nStage 2f: reacts to a stop sign via apparent SIZE when distance reads too far")
+    # Simulates a mis-scaled distance estimate (wrong intrinsics / tag size): the
+    # metric distance never drops below approach_distance_m, but the tag visibly
+    # grows in the frame. The size gate must still start the reaction — this is
+    # the "detects the stop sign but never acts on it" bug.
+    s = Sim()
+    far = s.cfg.approach_distance_m + 0.5            # distance gate can never fire
+    s.run(4, active=None, surr=CLEAR)
+    s.run(3, active=mk_active('stop', far, pixel_size=s.cfg.approach_pixel_size + 5), surr=CLEAR)
+    check(s.sm.state == APPROACHING_SIGN,
+          f"size gate started the reaction despite a far distance ({s.sm.state})")
+
+
+def test_stage2_stop_via_size_without_line():
+    print("\nStage 2g: stops at a stop sign via apparent size when no red line is painted")
+    # Distance sits outside at_sign_distance_m (so the metric 'at sign' never
+    # fires) and there is no stop line, but the tag grows past at_sign_pixel_size.
+    # The bot must still come to a full stop.
+    s = Sim()
+    s.run(2, active=None, surr=CLEAR)
+    s.run(2, active=mk_active('stop', 0.5, pixel_size=s.cfg.approach_pixel_size + 2), surr=CLEAR)
+    check(s.sm.state == APPROACHING_SIGN, "approaching the stop sign")
+    s.run(6, active=mk_active('stop', 0.5, pixel_size=s.cfg.at_sign_pixel_size + 5), surr=CLEAR)
+    check(s.reached(STOPPED), "came to a full stop via the size gate (no line needed)")
+
+
+def test_stage2_stop_via_lost_grace():
+    print("\nStage 2h: stops in front of a stop sign that slips out of view (no line, lost grace)")
+    # A high-mounted stop tag is seen while approaching, then disappears above the
+    # camera just as we reach it — no red line, and the distance/size gates never
+    # trip (distance stays > at_sign_distance_m, pixel_size 0). The lost-sign grace
+    # must bring us to a stop rather than coasting to the much-later failsafe.
+    s = Sim()
+    s.run(2, active=None, surr=CLEAR)
+    s.run(3, active=mk_active('stop', 0.45), surr=CLEAR)   # within approach range, not 'at sign'
+    check(s.sm.state == APPROACHING_SIGN, "approaching the stop sign")
+    n = int(s.cfg.lost_grace_s / s.dt) + 3                 # sign gone past the grace window
+    s.run(n, active=None, surr=CLEAR)
+    check(s.reached(STOPPED), "stopped via lost-sign grace (no line, sign left view)")
+    # The grace must act well before the line-search failsafe (else it overshoots).
+    check(s.cfg.lost_grace_s < s.cfg.line_search_max_s, "grace fires before the failsafe")
+
+
+def test_stage3_no_blind_turn_without_a_junction():
+    print("\nStage 3e: an intersection sign NEVER turns without a real stop line")
+    # See the intersection sign (latches a turn) but NO red stop line ever shows.
+    # The bot must keep lane-following straight through, not arc into the middle
+    # of the road — this is the "turns too early / turns into nothing" bug.
+    s = Sim()
+    s.run(2, active=mk_active('T-intersection', 0.5, turns=['left', 'right']), surr=CLEAR)
+    check(s.sm.state == APPROACHING_SIGN, "latched the intersection and is approaching")
+    s.run(int(s.cfg.line_search_max_s / s.dt) + 20, active=None, surr=CLEAR)
+    check(not s.reached(TURNING), "never entered TURNING without a junction")
+    check(s.sm.state == DRIVING, "fell back to lane following (drove straight through)")
+    check(s.smooth_ok, f"motion stayed smooth (worst jump {s.worst_jump:.3f} <= {s.max_step:.3f})")
+
+
+def test_stage3_force_turn():
+    print("\nStage 3d: force_turn overrides the random pick (when allowed)")
+    cfg = BehaviorConfig(); cfg.force_turn = "left"
+    s = Sim(cfg=cfg)
+    s.approach('T-intersection', turns=['left', 'right'], surr=CLEAR)
+    check(s.sm.chosen_turn == 'left', f"forced 'left' was chosen ({s.sm.chosen_turn})")
+    # If the sign forbids the forced turn, fall back to a valid one.
+    cfg2 = BehaviorConfig(); cfg2.force_turn = "left"
+    s2 = Sim(cfg=cfg2)
+    s2.approach('right-T-intersect', turns=['straight', 'right'], surr=CLEAR)
+    check(s2.sm.chosen_turn in ('straight', 'right'),
+          f"forbidden forced turn fell back to a valid one ({s2.sm.chosen_turn})")
+
+
 def test_stage2_new_sign_not_suppressed():
     print("\nStage 2d: a DIFFERENT sign right after one is handled is NOT suppressed")
     s = Sim()
     s.approach('stop', surr=CLEAR)  # handle stop sign tag 0
-    s.run(int(s.cfg.stop_pause_s / s.dt) + 6, active=None, surr=CLEAR)
+    s.run(int((s.cfg.stop_pause_s + s.cfg.turn_straight_s) / s.dt) + 10, active=None, surr=CLEAR)
     check(s.sm.state == DRIVING, "resumed after the first stop")
     # A genuinely different sign (tag 99) appears immediately, well within the
     # first sign's cooldown window. It must still be reacted to.
@@ -210,20 +305,24 @@ def test_stage3_random_turn():
     check(s.sm.chosen_turn in ('left', 'right'), f"chose a valid turn ({s.sm.chosen_turn})")
 
     chosen = s.sm.chosen_turn
-    s.run(int(s.cfg.stop_pause_s / s.dt) + 4, active=None, surr=CLEAR)  # pause + RoW
+    # Run the whole manoeuvre: stop pause + right-of-way + intersection entry +
+    # the arc itself, with margin.
+    total = (s.cfg.stop_pause_s + s.cfg.intersection_entry_s
+             + max(s.cfg.turn_left_s, s.cfg.turn_right_s))
+    s.run(int(total / s.dt) + 12, active=None, surr=CLEAR)
     check(s.reached(TURNING), "entered TURNING")
 
-    # During TURNING the arc command must match the configured turn.
+    # The bot must first drive straight INTO the intersection (entry phase), then
+    # arc the chosen way — so both a straight-entry frame and an arc frame appear.
     turning = [r for r in s.trace if r['state'] == TURNING]
+    ev = s.cfg.intersection_entry_speed
+    saw_entry = any(abs(r['left'] - ev) < 0.06 and abs(r['right'] - ev) < 0.06 for r in turning)
     want = {'left': (s.cfg.turn_left_left, s.cfg.turn_left_right),
             'right': (s.cfg.turn_right_left, s.cfg.turn_right_right)}[chosen]
-    # The slew limiter ramps toward the target; the *last* turning frame should
-    # be at (or very near) the commanded arc.
-    last_turn = turning[-1]
-    check(abs(last_turn['left'] - want[0]) < 0.12 and abs(last_turn['right'] - want[1]) < 0.12,
-          f"arc approached the configured {chosen} turn target")
+    saw_arc = any(abs(r['left'] - want[0]) < 0.12 and abs(r['right'] - want[1]) < 0.12 for r in turning)
+    check(saw_entry, "drove straight into the intersection before turning")
+    check(saw_arc, f"then arced the configured {chosen} turn")
 
-    s.run(int(max(s.cfg.turn_left_s, s.cfg.turn_right_s) / s.dt) + 6, active=None, surr=CLEAR)
     check(s.sm.state == DRIVING, "resumed DRIVING after completing the turn")
     check(s.smooth_ok, f"motion stayed smooth (worst jump {s.worst_jump:.3f} <= {s.max_step:.3f})")
 
@@ -314,19 +413,31 @@ def test_stage5_right_of_way_timeout():
     check(s.smooth_ok, f"motion stayed smooth (worst jump {s.worst_jump:.3f} <= {s.max_step:.3f})")
 
 
-def test_stage5_yield_checks_traffic():
-    print("\nStage 5b: yield slows, gives way, then continues (no full stop pause)")
+def test_stage5_yield_slows_then_resumes():
+    print("\nStage 5b: yield eases off near the sign, never stops, resumes cruise once past")
     s = Sim()
-    robot = Surroundings(robot_on_right=True)
-    # A robot is on our right as we reach the yield, so we must give way.
-    s.approach('yield', surr=robot)
-    check(s.reached(WAITING_FOR_RIGHT_OF_WAY), "yield went to the right-of-way check")
-    check(not s.reached(STOPPED), "yield did NOT use the full stop-and-pause state")
-    s.run(10, active=None, surr=robot)
-    check(s.sm.state == WAITING_FOR_RIGHT_OF_WAY, "kept yielding to the robot on the right")
-    # Clear -> continue.
-    s.run(6, active=None, surr=CLEAR)
-    check(s.sm.state == DRIVING, "continued after the way was clear")
+    s.run(12, active=None, surr=CLEAR)                       # reach steady cruise speed
+    cruise = max(s.trace[-1]['left'], s.trace[-1]['right'])
+    check(cruise > 0.0, "cruising before the yield sign")
+
+    # Yield sign comes into range -> slow down, but keep moving (no stop).
+    s.run(10, active=mk_active('yield', 0.45), surr=CLEAR)
+    check(s.sm.state == YIELDING, "entered YIELDING for the yield sign")
+    slow = max(s.trace[-1]['left'], s.trace[-1]['right'])
+    check(0.0 < slow < cruise, f"slowed down but kept moving ({slow:.3f} < {cruise:.3f})")
+
+    # A robot on the right must NOT make a yield halt (yield is give-way, not stop).
+    s.run(6, active=mk_active('yield', 0.40), surr=Surroundings(robot_on_right=True))
+    check(s.sm.state == YIELDING, "yield does not stop for a robot on the right")
+
+    # Drove past the sign (tag out of view) -> back to normal cruise speed.
+    s.run(int(s.cfg.lost_grace_s / s.dt) + 12, active=None, surr=CLEAR)
+    check(s.sm.state == DRIVING, "resumed DRIVING after passing the yield sign")
+    resumed = max(s.trace[-1]['left'], s.trace[-1]['right'])
+    check(resumed > slow + 1e-6, f"returned to normal speed after the yield ({resumed:.3f} > {slow:.3f})")
+    check(not s.reached(STOPPED) and not s.reached(WAITING_FOR_RIGHT_OF_WAY),
+          "yield never used the stop / right-of-way states")
+    check(s.smooth_ok, f"motion stayed smooth (worst jump {s.worst_jump:.3f} <= {s.max_step:.3f})")
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +502,13 @@ def main():
     test_stage2_stop_sign()
     test_stage2_cooldown()
     test_stage2_no_restop_while_sign_lingers()
+    test_stage2_stop_only_while_line_lingers()
     test_stage2_new_sign_not_suppressed()
+    test_stage2_size_gate_triggers_when_distance_far()
+    test_stage2_stop_via_size_without_line()
+    test_stage2_stop_via_lost_grace()
+    test_stage3_no_blind_turn_without_a_junction()
+    test_stage3_force_turn()
     test_stage3_random_turn()
     test_stage3_randomness_and_validity()
     test_stage3_only_allowed_turns()
@@ -399,7 +516,7 @@ def main():
     test_stage4_obstacle_during_approach()
     test_stage5_right_of_way_intersection()
     test_stage5_right_of_way_timeout()
-    test_stage5_yield_checks_traffic()
+    test_stage5_yield_slows_then_resumes()
     test_smoothness_stress()
     test_smoothness_small_dt()
     test_reset_lane_follower()

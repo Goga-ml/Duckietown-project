@@ -45,7 +45,7 @@ from dataclasses import replace as _dc_replace
 from tasks.traffic_signs.packages import detection_activity as student
 from tasks.traffic_signs.packages.state_machine import (
     TrafficSignStateMachine, MotionController, BehaviorConfig,
-    Surroundings, reset_lane_follower, DRIVING, APPROACHING_SIGN,
+    Surroundings, reset_lane_follower, DRIVING, APPROACHING_SIGN, YIELDING,
 )
 from tasks.traffic_signs.packages.stop_line import StopLineDetector
 try:
@@ -77,13 +77,14 @@ except Exception:
         "DRIVING": (60, 200, 60), "APPROACHING_SIGN": (0, 200, 255),
         "STOPPED": (60, 60, 220), "WAITING_FOR_RIGHT_OF_WAY": (0, 140, 255),
         "TURNING": (220, 170, 50), "OBSTACLE_STOP": (60, 60, 220),
+        "YIELDING": (0, 200, 255),
     }
 
     def draw_signs(img, detections):
         for d in detections:
             color = (60, 200, 60) if d.sign_type else (160, 160, 160)
             cv2.polylines(img, [d.corners.astype(np.int32)], True, color, 2)
-            label = f"{d.sign_type or ('id ' + str(d.tag_id))} {d.distance_m:.2f}m"
+            label = f"{d.sign_type or ('id ' + str(d.tag_id))} {d.distance_m:.2f}m {d.pixel_size:.0f}px"
             x1, y1 = d.bbox[0], d.bbox[1]
             cv2.putText(img, label, (x1, max(12, y1 - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
@@ -93,7 +94,9 @@ except Exception:
         if not active:
             return img
         turns = active.get("turns")
+        px = active.get("pixel_size")
         txt = (f"ACTIVE: {active['sign_type']} {active['distance_m']}m"
+               + (f" {px:.0f}px" if px is not None else "")
                + (f" turns={','.join(turns)}" if turns else "")
                + ("  [AT SIGN]" if active.get("at_sign") else ""))
         cv2.putText(img, txt, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
@@ -174,17 +177,31 @@ button{padding:10px 16px;margin:4px;border:0;border-radius:5px;font-size:14px;cu
   <input id="sp" type="range" min="0.05" max="0.5" step="0.01" value="0.2" style="vertical-align:middle;width:240px" oninput="onSpeed(this.value)">
   <b id="spv">0.20</b>
 </div>
+<div id="bar">
+  <span class="k">P gain:</span>
+  <input id="pg" type="range" min="0" max="1" step="0.01" value="0.1" style="vertical-align:middle;width:160px" oninput="onGain()">
+  <b id="pgv">0.10</b>
+  <span class="k" style="margin-left:14px">D gain:</span>
+  <input id="dg" type="range" min="0" max="2" step="0.01" value="0.35" style="vertical-align:middle;width:160px" oninput="onGain()">
+  <b id="dgv">0.35</b>
+</div>
 <script>
 function post(u){fetch(u,{method:'POST'});}
 function postJSON(u,d){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});}
 let spDirty=false;
 function onSpeed(v){document.getElementById('spv').textContent=parseFloat(v).toFixed(2);spDirty=true;
  postJSON('/set_speed',{value:parseFloat(v)}).then(()=>{spDirty=false;});}
+let gainDirty=false;
+function onGain(){var p=parseFloat(document.getElementById('pg').value),g=parseFloat(document.getElementById('dg').value);
+ document.getElementById('pgv').textContent=p.toFixed(2);document.getElementById('dgv').textContent=g.toFixed(2);gainDirty=true;
+ postJSON('/set_gains',{p_gain:p,d_gain:g}).then(()=>{gainDirty=false;});}
 async function poll(){try{let d=await(await fetch('/status')).json();
  document.getElementById('st').textContent=d.behavior_state||'-';
  let a=d.active_sign; document.getElementById('sg').textContent=a?(a.sign_type+' '+a.distance_m+'m'):'none';
  document.getElementById('dr').textContent=d.detector_ready?('ready ('+(d.family||'')+')'):(d.load_error||'…');
  if(!spDirty && d.base_speed!=null){document.getElementById('sp').value=d.base_speed;document.getElementById('spv').textContent=Number(d.base_speed).toFixed(2);}
+ if(!gainDirty && d.p_gain!=null){document.getElementById('pg').value=d.p_gain;document.getElementById('pgv').textContent=Number(d.p_gain).toFixed(2);}
+ if(!gainDirty && d.d_gain!=null){document.getElementById('dg').value=d.d_gain;document.getElementById('dgv').textContent=Number(d.d_gain).toFixed(2);}
 }catch(e){}}
 setInterval(poll,300);poll();
 </script></body></html>"""
@@ -221,6 +238,26 @@ _control_lock = threading.Lock()
 keys_pressed      = {'up': False, 'down': False, 'left': False, 'right': False}
 _keys_lock        = threading.Lock()
 _keys_last_update = time.time()
+
+
+def _mask_sign_regions(frame_rgb, detections, pad=12):
+    """Black out detected sign tags before lane detection so the tag's white
+    cells/border aren't mistaken for the white lane line (which makes the bot
+    veer toward / drive into the sign). Detections come from a background thread,
+    so they lag the live frame; we pad each box generously and IN PROPORTION to
+    the tag's size (a close tag is large AND sweeps across the frame fastest), so
+    the real tag stays covered even though it has moved since it was detected.
+    Returns the original frame if there's nothing to mask."""
+    if not detections:
+        return frame_rgb
+    out = frame_rgb.copy()
+    h, w = out.shape[:2]
+    for d in detections:
+        x1, y1, x2, y2 = d.bbox
+        px = max(pad, int(0.6 * (x2 - x1)))
+        py = max(pad, int(0.6 * (y2 - y1)))
+        out[max(0, y1 - py):min(h, y2 + py), max(0, x1 - px):min(w, x2 + px)] = 0
+    return out
 
 
 def manual_control_loop():
@@ -324,14 +361,15 @@ def visualize(frame_bgr):
 
             # Always compute lane following (cheap) so the overlay shows what the
             # bot sees even before /start; only the wheels are gated on `running`.
-            lane_cmd = lane_agent.compute_commands(frame_rgb)
+            # Mask out sign tags first so they don't pollute the white-line mask.
+            lane_cmd = lane_agent.compute_commands(_mask_sign_regions(frame_rgb, detections))
             lane_dbg = lane_agent.last_debug_info
 
             if not running:
                 wheels.set_wheels_speed(0.0, 0.0)
             else:
                 cmd = sign_sm.update(active, surr, dt)
-                if sign_sm.state == DRIVING and _prev_state not in (DRIVING, APPROACHING_SIGN):
+                if sign_sm.state == DRIVING and _prev_state not in (DRIVING, APPROACHING_SIGN, YIELDING):
                     reset_lane_follower(lane_agent)
                 _prev_state = sign_sm.state
                 if cmd.kind == 'lane_follow':
@@ -342,6 +380,11 @@ def visualize(frame_bgr):
                     # halt/turn still ramps down smoothly from the real speed.
                     left  = float(np.clip(lane_cmd[0] * cmd.speed_scale, 0.0, 1.0))
                     right = float(np.clip(lane_cmd[1] * cmd.speed_scale, 0.0, 1.0))
+                    # Lane lost ("searching"): the follower commands 0,0 and the
+                    # bot stalls. Creep straight forward instead so it pushes
+                    # through gaps / blank intersections until it re-finds the lane.
+                    if not (lane_dbg or {}).get('lane_detected', True):
+                        left = right = float(np.clip(sign_sm.cfg.lane_lost_creep, 0.0, 1.0))
                     motion.sync(left, right)
                 else:
                     left, right = motion.step(cmd, lane_cmd, dt)
@@ -435,6 +478,19 @@ def set_speed():
         lane_agent.curve_speed = v
     return jsonify({'base_speed': getattr(lane_agent, 'base_speed', None)})
 
+@app.route('/set_gains', methods=['POST'])
+def set_gains():
+    """Live lane-follower gain adjuster: P (steering / lateral) and D (damping).
+    Takes effect on the next frame; not persisted to the config file."""
+    data = request.json or {}
+    if lane_agent is not None:
+        if data.get('p_gain') is not None:
+            lane_agent.p_gain = max(0.0, float(data['p_gain']))
+        if data.get('d_gain') is not None:
+            lane_agent.d_gain = max(0.0, float(data['d_gain']))
+    return jsonify({'p_gain': getattr(lane_agent, 'p_gain', None),
+                    'd_gain': getattr(lane_agent, 'd_gain', None)})
+
 @app.route('/status')
 def status():
     with _detection_lock:
@@ -449,6 +505,8 @@ def status():
         'load_error':     sign_agent.load_error if sign_agent else None,
         'family':         sign_agent.family if sign_agent else None,
         'base_speed':     getattr(lane_agent, 'base_speed', None) if lane_agent else None,
+        'p_gain':         getattr(lane_agent, 'p_gain', None) if lane_agent else None,
+        'd_gain':         getattr(lane_agent, 'd_gain', None) if lane_agent else None,
         'active_sign':    active,
         'behavior_state': sign_sm.state if sign_sm else None,
         'behavior_note':  sign_sm.note if sign_sm else None,
@@ -459,7 +517,7 @@ def status():
         'sensor_ready':   surround_sensor is not None and surround_sensor.model_loaded,
         'detections': [
             {'tag_id': d.tag_id, 'sign_type': d.sign_type, 'distance_m': d.distance_m,
-             'turns': d.turns, 'offset_norm': d.offset_norm}
+             'pixel_size': d.pixel_size, 'turns': d.turns, 'offset_norm': d.offset_norm}
             for d in dets
         ],
     })

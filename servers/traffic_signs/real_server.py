@@ -19,7 +19,7 @@ from tasks.traffic_signs.packages.agent import TrafficSignAgent
 from tasks.traffic_signs.packages import detection_activity as student
 from tasks.traffic_signs.packages.state_machine import (
     TrafficSignStateMachine, MotionController, BehaviorConfig,
-    Surroundings, reset_lane_follower, DRIVING, APPROACHING_SIGN,
+    Surroundings, reset_lane_follower, DRIVING, APPROACHING_SIGN, YIELDING,
 )
 from tasks.traffic_signs.packages.stop_line import StopLineDetector
 try:
@@ -74,6 +74,25 @@ _control_lock    = threading.Lock()     # serialises the per-tick control + whee
 keys_pressed      = {'up': False, 'down': False, 'left': False, 'right': False}
 _keys_lock        = threading.Lock()
 _keys_last_update = time.time()
+
+
+def _mask_sign_regions(frame_rgb, detections, pad=12):
+    """Black out detected sign tags before lane detection so the tag's white
+    cells/border aren't mistaken for the white lane line (which makes the bot
+    veer toward / drive into the sign). Detections come from a background thread,
+    so they lag the live frame; we pad each box generously and IN PROPORTION to
+    the tag's size (a close tag is large AND sweeps across the frame fastest), so
+    the real tag stays covered even though it has moved since it was detected."""
+    if not detections:
+        return frame_rgb
+    out = frame_rgb.copy()
+    h, w = out.shape[:2]
+    for d in detections:
+        x1, y1, x2, y2 = d.bbox
+        px = max(pad, int(0.6 * (x2 - x1)))
+        py = max(pad, int(0.6 * (y2 - y1)))
+        out[max(0, y1 - py):min(h, y2 + py), max(0, x1 - px):min(w, x2 + px)] = 0
+    return out
 
 
 def manual_control_loop():
@@ -185,7 +204,8 @@ def visualize(frame_bgr):
 
             # Always run the lane follower so the overlay can show the lane
             # points even before /start; only wheel output is gated on `running`.
-            lane_cmd = lane_agent.compute_commands(frame_rgb)
+            # Mask out sign tags so they don't pollute the white-line mask.
+            lane_cmd = lane_agent.compute_commands(_mask_sign_regions(frame_rgb, detections))
             lane_dbg = lane_agent.last_debug_info
 
             if not running:
@@ -194,7 +214,7 @@ def visualize(frame_bgr):
                 cmd = sign_sm.update(active, surr, dt)
                 # On the edge back into DRIVING (from a stop/turn/obstacle), clear
                 # the lane agent's stale PD state so it doesn't lurch.
-                if sign_sm.state == DRIVING and _prev_state not in (DRIVING, APPROACHING_SIGN):
+                if sign_sm.state == DRIVING and _prev_state not in (DRIVING, APPROACHING_SIGN, YIELDING):
                     reset_lane_follower(lane_agent)
                 _prev_state = sign_sm.state
                 if cmd.kind == 'lane_follow':
@@ -206,6 +226,11 @@ def visualize(frame_bgr):
                     import numpy as _np
                     left  = float(_np.clip(lane_cmd[0] * cmd.speed_scale, 0.0, 1.0))
                     right = float(_np.clip(lane_cmd[1] * cmd.speed_scale, 0.0, 1.0))
+                    # Lane lost ("searching"): the follower commands 0,0 and the
+                    # bot stalls. Creep straight forward instead so it pushes
+                    # through gaps / blank intersections until it re-finds the lane.
+                    if not (lane_dbg or {}).get('lane_detected', True):
+                        left = right = float(_np.clip(sign_sm.cfg.lane_lost_creep, 0.0, 1.0))
                     motion.sync(left, right)
                 else:
                     left, right = motion.step(cmd, lane_cmd, dt)
@@ -301,6 +326,19 @@ def set_speed():
         lane_agent.curve_speed = v
     return jsonify({'base_speed': getattr(lane_agent, 'base_speed', None)})
 
+@app.route('/set_gains', methods=['POST'])
+def set_gains():
+    """Live lane-follower gain adjuster: P (steering / lateral) and D (damping).
+    Takes effect on the next frame; not persisted to the config file."""
+    data = request.json or {}
+    if lane_agent is not None:
+        if data.get('p_gain') is not None:
+            lane_agent.p_gain = max(0.0, float(data['p_gain']))
+        if data.get('d_gain') is not None:
+            lane_agent.d_gain = max(0.0, float(data['d_gain']))
+    return jsonify({'p_gain': getattr(lane_agent, 'p_gain', None),
+                    'd_gain': getattr(lane_agent, 'd_gain', None)})
+
 @app.route('/status')
 def status():
     with _detection_lock:
@@ -315,6 +353,8 @@ def status():
         'load_error':     sign_agent.load_error if sign_agent else None,
         'family':         sign_agent.family if sign_agent else None,
         'base_speed':     getattr(lane_agent, 'base_speed', None) if lane_agent else None,
+        'p_gain':         getattr(lane_agent, 'p_gain', None) if lane_agent else None,
+        'd_gain':         getattr(lane_agent, 'd_gain', None) if lane_agent else None,
         'active_sign':    active,
         # Behaviour state machine (Person B).
         'behavior_state': sign_sm.state if sign_sm else None,
@@ -326,7 +366,7 @@ def status():
         'sensor_ready':   surround_sensor is not None and surround_sensor.model_loaded,
         'detections': [
             {'tag_id': d.tag_id, 'sign_type': d.sign_type, 'distance_m': d.distance_m,
-             'turns': d.turns, 'offset_norm': d.offset_norm}
+             'pixel_size': d.pixel_size, 'turns': d.turns, 'offset_norm': d.offset_norm}
             for d in dets
         ],
     })

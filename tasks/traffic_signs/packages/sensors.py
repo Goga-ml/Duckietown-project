@@ -38,6 +38,15 @@ from tasks.traffic_signs.packages.state_machine import Surroundings
 # degrades to "no obstacle/right-of-way" rather than crashing.
 from tasks.object_detection.packages.stop_activity import should_stop
 
+# object_detection class ids: 0=duckie, 1=truck, 2=sign. In THIS task the
+# roadside traffic signs are the whole point and are handled by the AprilTag
+# perception layer — they are NOT obstacles. should_stop() (reused from
+# object_detection) treats any detection in the central zone as a blocker, so
+# without this filter the bot halts dead at every sign ("sign in lane") and the
+# right-of-way check mistakes a sign on the right for another robot. Keep only
+# real vehicles (duckie/truck) for the "is the way clear?" questions.
+_SIGN_CLASS = 2
+
 _CONFIG_FILE = os.path.normpath(os.path.join(
     os.path.dirname(__file__), '..', '..', '..', 'config', 'traffic_signs_config.yaml'
 ))
@@ -114,9 +123,13 @@ class SurroundingsSensor:
             if detections is None:        # skipped frame -> keep last reading
                 return self._last
 
+            # Drop the task's own roadside signs — they are not obstacles or
+            # other robots (see _SIGN_CLASS above); only duckie/truck count.
+            vehicles = [d for d in detections if d[2] != _SIGN_CLASS]
+
             # Reuse object_detection's obstacle-ahead state machine as-is.
-            obstacle_ahead, reason = should_stop(detections, size)
-            robot_on_right = self._update_robot_on_right(detections, size)
+            obstacle_ahead, reason = should_stop(vehicles, size)
+            robot_on_right = self._update_robot_on_right(vehicles, size)
 
             self._last = Surroundings(
                 obstacle_ahead=obstacle_ahead,

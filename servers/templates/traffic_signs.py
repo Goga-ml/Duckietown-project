@@ -82,11 +82,27 @@ _CONTENT = '''
             </div>
 
             <div class="card">
-                <div class="card-header">Speed</div>
-                <div style="display:flex;align-items:center;gap:10px">
+                <div class="card-header">Lane Following Tuning</div>
+                <div style="margin-bottom:12px">
+                    <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-secondary);margin-bottom:4px">
+                        <span>Speed</span><span id="speed-value" style="font-variant-numeric:tabular-nums">0.20</span>
+                    </div>
                     <input id="speed-slider" type="range" min="0.05" max="0.5" step="0.01" value="0.2"
-                        style="flex:1" oninput="onSpeedChange(this.value)">
-                    <span id="speed-value" style="font-size:13px;font-variant-numeric:tabular-nums;min-width:32px">0.20</span>
+                        style="width:100%" oninput="onSpeedChange(this.value)">
+                </div>
+                <div style="margin-bottom:12px">
+                    <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-secondary);margin-bottom:4px">
+                        <span>Steering gain (P)</span><span id="pgain-value" style="font-variant-numeric:tabular-nums">0.10</span>
+                    </div>
+                    <input id="pgain-slider" type="range" min="0" max="1" step="0.01" value="0.1"
+                        style="width:100%" oninput="onGainChange()">
+                </div>
+                <div>
+                    <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-secondary);margin-bottom:4px">
+                        <span>Damping gain (D)</span><span id="dgain-value" style="font-variant-numeric:tabular-nums">0.35</span>
+                    </div>
+                    <input id="dgain-slider" type="range" min="0" max="2" step="0.01" value="0.35"
+                        style="width:100%" oninput="onGainChange()">
                 </div>
             </div>
 
@@ -170,6 +186,16 @@ _EXTRA_JS = '''
         postJSON('/set_speed', {value: parseFloat(value)}).then(() => { _speedDirty = false; });
     }
 
+    let _gainDirty = false;
+    function onGainChange() {
+        const p = parseFloat(document.getElementById('pgain-slider').value);
+        const d = parseFloat(document.getElementById('dgain-slider').value);
+        document.getElementById('pgain-value').textContent = p.toFixed(2);
+        document.getElementById('dgain-value').textContent = d.toFixed(2);
+        _gainDirty = true;
+        postJSON('/set_gains', {p_gain: p, d_gain: d}).then(() => { _gainDirty = false; });
+    }
+
     async function pollStatus() {
         try {
             const data = await fetch('/status').then(r => r.json());
@@ -178,6 +204,14 @@ _EXTRA_JS = '''
             if (!_speedDirty && data.base_speed != null) {
                 document.getElementById('speed-slider').value = data.base_speed;
                 document.getElementById('speed-value').textContent = Number(data.base_speed).toFixed(2);
+            }
+            if (!_gainDirty && data.p_gain != null) {
+                document.getElementById('pgain-slider').value = data.p_gain;
+                document.getElementById('pgain-value').textContent = Number(data.p_gain).toFixed(2);
+            }
+            if (!_gainDirty && data.d_gain != null) {
+                document.getElementById('dgain-slider').value = data.d_gain;
+                document.getElementById('dgain-value').textContent = Number(data.d_gain).toFixed(2);
             }
 
             const status = document.getElementById('model-status');

@@ -107,8 +107,14 @@ class LaneServoingAgent:
         right = speed + steering
 
         if is_curve and abs(steering) > self.steering_threshold:
+            # Boost the outer wheel through a sharp curve. Both directions use the
+            # SAME configurable curve_boost so left and right corners behave
+            # symmetrically (the old code hard-coded 5x on one side, which
+            # saturated that wheel and made one turn direction pivot violently
+            # while the other was gentle). Raise curve_boost in the config if
+            # corners need more bite.
             if steering > 0:
-                right *= 5
+                right *= self.curve_boost
             else:
                 left  *= self.curve_boost
 

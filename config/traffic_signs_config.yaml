@@ -41,6 +41,16 @@ tag:
   size_m: 0.065
 
 # ---------------------------------------------------------------------------
+# Tag ID -> sign meaning for THIS town. Overrides the example defaults in
+# packages/sign_lookup.py (DEFAULT_TAG_IDS); any tag not listed here keeps its
+# default. sign_type strings must be ones SIGN_INFO knows (stop, yield,
+# T-intersection, left-T-intersect, right-T-intersect, 4-way-intersect, ...).
+# ---------------------------------------------------------------------------
+signs:
+  20: stop        # stop sign on our map
+  24: stop        # stop sign on our map
+
+# ---------------------------------------------------------------------------
 # Behaviour layer (Person B) — the state machine in
 # tasks/traffic_signs/packages/state_machine.py reads this block. Keys map 1:1
 # to BehaviorConfig fields; anything omitted falls back to the dataclass
@@ -50,14 +60,33 @@ behavior:
   # --- Sign approach / stop timing (metres / seconds) ---
   approach_distance_m: 0.60   # start reacting to a sign at this forward range
   at_sign_distance_m:  0.30   # "arrived" range (keep == perception AT_SIGN_DISTANCE_M)
+  # Apparent-size fallback for closeness (tag edge length in PIXELS). distance_m
+  # is only as good as the camera intrinsics + tag.size_m above; if those don't
+  # match your (sim or real) camera it reads systematically off and the bot then
+  # "sees but ignores" the sign. pixel_size is read straight off the image, so it
+  # makes the reaction fire anyway. A sign counts as close when EITHER the metric
+  # OR the pixel gate trips. Watch the number the video overlay prints next to
+  # each sign ("... 36px") and set these to the px seen at ~0.60 m and ~0.30 m.
+  # Set 0 to disable a size gate and use distance only.
+  approach_pixel_size: 34.0   # ~ 6.5cm tag at 0.60 m with the default fx≈340
+  at_sign_pixel_size:  68.0   # ~ 6.5cm tag at 0.30 m with the default fx≈340
   stop_pause_s:        2.0     # how long to sit still at a stop sign
-  yield_creep_scale:   0.40    # min speed fraction while creeping past a yield
+  # Yield sign = ease off a little while the sign is in range, then go back to
+  # normal speed once we've driven past it (NO stop, no right-of-way wait).
+  # 1.0 = no slowdown; lower = slower. 0.7 is a gentle ~30% cut ("slow down a bit").
+  yield_slow_scale:    0.7
+  yield_creep_scale:   0.40    # legacy; unused by the current "slow down then continue" yield
   cruise_scale:        1.0     # lane-follow speed scale while just driving
   # Turn-option/stop signs sit BEFORE the junction: after seeing one, the bot
   # keeps lane-following at this speed until it reaches the red stop line, then
   # acts (stops / turns) — like real traffic. Raise approach_line_scale toward
   # cruise for a brisker roll-up; lower it to creep more cautiously.
   approach_line_scale: 0.8     # lane-follow speed while rolling up to the stop line
+  # When the lane follower loses the lane it normally commands 0 and the bot
+  # stalls ("LANE: searching"). Instead, creep straight forward at this normalized
+  # wheel speed so it pushes through gaps / blank intersections until it re-finds
+  # the lane. Raise for a brisker push-through; set 0 to stop-when-lost instead.
+  lane_lost_creep:     0.18
   line_search_max_s:   6.0     # if no red stop line is seen by now, act anyway (failsafe)
   cooldown_s:          3.0     # min hold on the "just handled this sign" latch
   lost_grace_s:        0.5     # sign vanished right at the bot -> treat as arrived
@@ -76,6 +105,18 @@ behavior:
   turn_straight_left:  0.28
   turn_straight_right: 0.28
   turn_straight_s:     1.2
+  # After the stop line, pull straight INTO the intersection before turning, so
+  # the bot turns from inside the junction (not at the sign). Increase entry_s if
+  # it still turns too early; set 0 to turn right at the line.
+  intersection_entry_s:     0.8
+  intersection_entry_speed: 0.30
+  # Turn choice: "" = random allowed turn (spec). Set "left"/"right"/"straight"
+  # to force it (when the sign allows it) — e.g. to check the turn arc isn't
+  # inverted on the bot, or for a junction that only goes one way.
+  force_turn: ""
+  # OVERTURNING? The turns are open-loop (timed). Reduce turn_left_s/turn_right_s
+  # (e.g. 1.6 -> 1.2) so it rotates less, and/or lower the arc speed
+  # (turn_left_right / turn_right_left) for a gentler, more repeatable turn.
 
   # --- Motion smoothing (the "no jerky stops" guarantee) ---
   max_accel: 2.0    # max change in a wheel command per second (slew-rate limit)

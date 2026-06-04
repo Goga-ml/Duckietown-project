@@ -13,6 +13,7 @@ This file is the seam between perception and behaviour:
           "turns":       None | ["left", "right"],
           "distance_m":  0.30,
           "offset_norm": -0.12,   # -1 far-left .. +1 far-right in the frame
+          "pixel_size":  36.0,    # apparent tag edge length in px (closeness, calibration-free)
           "at_sign":     True,    # within AT_SIGN_DISTANCE_M of the bot
         }
 
@@ -76,5 +77,11 @@ def select_active_sign(detections: List) -> Optional[dict]:
         "turns":       nearest.turns,
         "distance_m":  round(nearest.distance_m, 3),
         "offset_norm": round(nearest.offset_norm, 3),
+        # Apparent tag edge length in pixels. Measured straight from the detected
+        # corners, so — unlike distance_m — it does NOT depend on the camera
+        # intrinsics or the assumed tag size being correct. The behaviour layer
+        # uses it as a robust "how close am I?" signal that still works when the
+        # configured intrinsics don't match the (sim or real) camera.
+        "pixel_size":  round(nearest.pixel_size, 1),
         "at_sign":     nearest.distance_m <= AT_SIGN_DISTANCE_M,
     }
