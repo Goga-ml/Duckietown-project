@@ -50,6 +50,15 @@ signs:
   20: stop        # stop sign on our map
   24: stop        # stop sign on our map
 
+# Fallback for a tag that decodes but is NOT mapped (neither above nor in the
+# sign_lookup.py defaults). Our physical yield sign's tag ID is unknown and it
+# is the ONLY unmapped sign on the map, so treat any unmapped tag as a yield —
+# the most benign reaction (slows a little, never stops/turns). Known signs
+# always take priority; this only fires when no mapped sign is in view, and the
+# size/distance filters still apply. Set "" to disable. Retire this by reading
+# the real tag_id off GET /status and mapping it under `signs:` above.
+unknown_sign_as: "yield"
+
 # ---------------------------------------------------------------------------
 # Behaviour layer (Person B) — the state machine in
 # tasks/traffic_signs/packages/state_machine.py reads this block. Keys map 1:1
